@@ -240,8 +240,8 @@ class MeshTopApp:
             }
 
         # set timeout and cooldown windows
-        self.trace_deadline = now + self.trace_timeout_secs
-        self.trace_cooldown_end = now + self.trace_min_cooldown_secs
+        self.trace_deadline = now + self.trace_timeout_sec
+        self.trace_cooldown_end = now + self.trace_cooldown_sec
 
         dest = target.node_id or target.num  # prefer node_id
         # launch background worker
@@ -252,8 +252,8 @@ class MeshTopApp:
 
     def __init__(self, host: str, port: int = 4403):
         # --- trace timing (auto-timeout + cooldown) ---
-        self.trace_timeout_sec = 15.0     # how long to wait for a result
-        self.trace_cooldown_sec = 1.5     # short pause before you can start next trace
+        self.trace_timeout_sec = 30.0  # how long we wait for a result
+        self.trace_cooldown_sec = 3.0  # minimum pause between traces
         self.trace_started_at: Optional[float] = None
 
         self.host = host
@@ -302,10 +302,8 @@ class MeshTopApp:
         self.trace_lock = threading.Lock()
 
         # ---- add these ----
-        self.trace_deadline = 0.0  # when the current trace attempt should time out
-        self.trace_cooldown_end = 0.0  # block new traces until this time
-        self.trace_timeout_secs = 12  # how long we wait for a result
-        self.trace_min_cooldown_secs = 3  # grace period between keypresses
+        self.trace_deadline = 0.0
+        self.trace_cooldown_end = 0.0
 
     # ---------- Connection and initial load ----------
 
@@ -799,6 +797,28 @@ class MeshTopApp:
 
 
     # ---------- NODES view ----------
+    def _format_hops_table(self, names: List[str], snrs_raw: List[Optional[int]], maxw: int, title: str) -> List[str]:
+        def snr_txt(i: int) -> str:
+            if i >= len(snrs_raw) or snrs_raw[i] in (None, -128):
+                return "? dB"
+            return f"{snrs_raw[i] / 4.0:.1f} dB"
+
+        col_no, col_from, col_to, col_snr = 3, 14, 14, 8
+        rule = "─" * min(maxw, col_no + 1 + col_from + 1 + 1 + 1 + col_to + 2 + col_snr)
+        lines = [title[:maxw], rule]
+
+        for i in range(len(names) - 1):
+            left = names[i][:col_from].ljust(col_from)
+            right = names[i + 1][:col_to].ljust(col_to)
+            snr = snr_txt(i).rjust(col_snr)
+            row = f"{str(i + 1).rjust(col_no - 1)} {left} → {right}  {snr}"
+            lines.append(row[:maxw])
+
+        if len(names) == 1:
+            lines.append(f"{'1'.rjust(col_no - 1)} {names[0][:col_from].ljust(col_from)}")
+
+        return lines
+
     def _draw_trace_view(self, stdscr):
         h, w = stdscr.getmaxyx()
         maxw = w - 1
@@ -808,9 +828,8 @@ class MeshTopApp:
         with self.trace_lock:
             tr = dict(self.trace_result) if self.trace_result is not None else {}
 
-        # header
-        title_bar = "meshtop – TRACE (t retry, n nodes, m messages, q quit)"
-        stdscr.addnstr(0, 0, title_bar[:maxw].ljust(maxw), maxw, curses.A_REVERSE)
+
+
 
         if self.trace_target_num is None or self.trace_target_num not in self.nodes:
             stdscr.addnstr(top, 0, "No node selected for trace.".ljust(maxw), maxw)
@@ -841,10 +860,11 @@ class MeshTopApp:
                 stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
                 y += 2
             else:
-                remain = getattr(self, "trace_timeout_sec", None)
+                remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
+                stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
+                y += 1
                 if remain is not None:
-                    remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
-                    stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
+
                     y += 1
                 stdscr.addnstr(y, 0, "No traceroute result yet.".ljust(maxw), maxw)
                 y += 2
@@ -866,23 +886,22 @@ class MeshTopApp:
 
         # To destination
         # To destination
-        stdscr.addnstr(y, 0, "Route to destination:".ljust(maxw), maxw, curses.A_BOLD)
-        y += 1
-        for ln in _wrap_hops(names, snr_fwd, maxw, indent="  ", hops_per_line=1):
-            stdscr.addnstr(y, 0, ln[:maxw].ljust(maxw), maxw)
+
+        for line in self._format_hops_table(names, snr_fwd, maxw, "Route to destination"):
+            stdscr.addnstr(y, 0, line.ljust(maxw), maxw);
             y += 1
 
-        # Back to us
         y += 1
-        stdscr.addnstr(y, 0, "Route back to us:".ljust(maxw), maxw, curses.A_BOLD)
+
+        stdscr.addnstr(y, 0, "Route back to us".ljust(maxw), maxw, curses.A_BOLD);
         y += 1
         if snr_back and len(names) >= 2:
             back_names = list(reversed(names))
-            for ln in _wrap_hops(back_names, snr_back, maxw, indent="  ", hops_per_line=1):
-                stdscr.addnstr(y, 0, ln[:maxw].ljust(maxw), maxw)
+            for line in self._format_hops_table(back_names, snr_back, maxw, ""):
+                stdscr.addnstr(y, 0, line.ljust(maxw), maxw);
                 y += 1
         else:
-            stdscr.addnstr(y, 0, "  (no return SNRs reported)".ljust(maxw), maxw)
+            stdscr.addnstr(y, 0, "  (no return SNRs reported)".ljust(maxw), maxw);
             y += 1
 
     def _draw_nodes_view(self, stdscr):
