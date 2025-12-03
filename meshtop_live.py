@@ -527,7 +527,7 @@ class MeshTopApp:
             stdscr.addnstr(start_row, 0, "(no messages yet)".ljust(maxw), maxw)
             return
 
-        msgs = self.messages[-max_rows:]
+        msgs = list(reversed(self.messages[-max_rows:]))
         for i, msg in enumerate(msgs):
             row_y = start_row + i
             if row_y >= h - 1:
@@ -737,7 +737,7 @@ class MeshTopApp:
             return
 
         # Work with the full list (or cap to last 1000 for sanity)
-        msgs = self.messages[-1000:]
+        msgs = list(reversed(self.messages[-1000:]))
         total = len(msgs)
 
         # selected_msg_index is relative to full self.messages; remap if needed
