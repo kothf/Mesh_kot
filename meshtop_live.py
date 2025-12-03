@@ -967,7 +967,10 @@ class MeshTopApp:
 
         started = tr.get("ts") or time.time()
         elapsed = time.time() - started
-        status = "OK" if tr.get("route") else ("Error" if tr.get("error") else "Waiting…")
+        route = tr.get("route", [])
+        err = tr.get("error")
+        status = "OK" if route else ("Error" if err else "Waiting…")
+
         stdscr.addnstr(top + 1, 0, f"Status: {status}    Elapsed: {elapsed:.1f}s".ljust(maxw), maxw)
 
         route = tr.get("route", []) or []
@@ -978,22 +981,32 @@ class MeshTopApp:
         y = top + 3
 
         # Waiting / Error
-        if err or not route:
-            if err:
-                stdscr.addnstr(y, 0, f"Error: {err}".ljust(maxw), maxw)
-                y += 1
-                stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
-                y += 2
-            else:
-                remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
-                stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
-                y += 1
-                if remain is not None:
+        # Waiting / Error / Zero-hop
+        if err:
+            stdscr.addnstr(y, 0, f"Error: {err}".ljust(maxw), maxw)
+            y += 1
+            stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
+            y += 2
+            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
+            return
+        elif route is not None and len(route) == 0:
+            # Treat zero hops as "no trace result yet" to avoid showing any table.
+            remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
+            stdscr.addnstr(y, 0, f"Waiting for trace… (~{remain:.1f}s left)".ljust(maxw), maxw)
+            y += 1
+            stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
+            y += 1
+            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
+            return
 
-                    y += 1
-                stdscr.addnstr(y, 0, "No traceroute result yet.".ljust(maxw), maxw)
-                y += 2
 
+        elif not route:
+            # Still waiting for a non-empty route
+            remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
+            stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
+            y += 2
+            stdscr.addnstr(y, 0, "No traceroute result yet.".ljust(maxw), maxw)
+            y += 2
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
 
