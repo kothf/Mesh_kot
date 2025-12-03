@@ -73,37 +73,79 @@ class MessageInfo:
 # ---------- Helpers ----------
 def looks_like_human_text(s: str) -> bool:
     """
-    Keep real text in any language. Drop binary-ish noise.
-    - Accept letters/numbers from all scripts, whitespace, punctuation & symbols.
-    - Reject if too many 'other' chars or very long repeated runs.
+    Human-friendly filter:
+    - Allows emoji and classic ASCII emoticons (:-), <3, :D, etc.)
+    - Lenient with stretched letters ("helllllooo")
+    - Blocks binary-ish garbage and extreme repeats
+    - Works for any language/script without extra deps
     """
     if not s:
         return False
-    n = len(s)
 
-    # long repeated runs of the same char (e.g., "%%%%%%%%%%%%%")
-    if re.search(r'(.)\1{8,}', s):
+    s = s.replace("\x00", "")
+
+    # Hard garbage: a single char repeated 21+ times (e.g., "%%%%%%%%%%%%%%%")
+    import re, unicodedata
+    if re.search(r'(.)\1{20,}', s):
         return False
 
-    letters = digits = ok = 0
-    for ch in s:
-        cat = unicodedata.category(ch)  # e.g. 'Ll', 'Nd', 'Zs', 'Po', 'So'
-        if cat[0] in ('L', 'N'):      # letters & numbers — keep (all languages)
-            letters += (cat[0] == 'L')
-            digits  += (cat[0] == 'N')
-            ok += 1
-        elif cat[0] in ('Z', 'P', 'S'):  # spaces, punctuation, symbols (includes emoji)
-            ok += 1
-        elif ch in '\t':
-            ok += 1
+    # Detect emoji (basic, wide coverage of modern ranges)
+    emoji_re = re.compile(
+        '['
+        '\U0001F300-\U0001FAD6'  # Misc Symbols & Pictographs + Extended
+        '\U0001F680-\U0001F6FF'  # Transport & Map
+        '\U0001F900-\U0001FAFF'  # Supplemental Symbols & Pictographs
+        '\U00002700-\U000027BF'  # Dingbats
+        '\U00002600-\U000026FF'  # Misc Symbols
+        '\U0001FA70-\U0001FAFF'  # Symbols & Pictographs Extended-A
+        ']+',
+        flags=re.UNICODE
+    )
 
-    # Heuristics:
-    ratio_ok = ok / n
-    ratio_letters = letters / n
-    # If most chars are acceptable, and at least a few are letters, keep it
-    if ratio_ok >= 0.70 and (letters >= 3 or ratio_letters >= 0.15):
+    # Common ASCII emoticons (keep this list compact but useful)
+    emoticon_re = re.compile(
+        r'(\:\-?\)|\:\-?\(|\;\-?\)|\:D|\:P|\:p|\;P|\;p|\:\-?D|\:\-?P|\:\-?p|\<3|\:\-?O|\:\-?o|\:\-?\/|\:\-?\||\^_\^)',
+        flags=re.UNICODE
+    )
+
+    # Quick whitelist: any emoji or common emoticon -> probably human
+    has_emoji = bool(emoji_re.search(s))
+    has_emoticon = bool(emoticon_re.search(s))
+    if has_emoji or has_emoticon:
+        # still reject if it's *only* one repeated symbol character
+        if re.fullmatch(r'[\W_]{1,}', s) and len(set(s)) == 1 and len(s) > 10:
+            return False
         return True
-    return False
+
+    # Un-stretch letters/numbers for analysis so "cooooool" becomes "coool" -> "cool"
+    s2 = re.sub(r'([0-9A-Za-zА-Яа-я])\1{2,}', r'\1\1', s)
+    if not s2:
+        return False
+
+    n = len(s2)
+    ok = 0
+    letters = 0
+    for ch in s2:
+        cat = unicodedata.category(ch)  # L*, N*, Z*, P*, S*
+        if cat[0] in ('L', 'N', 'Z', 'P', 'S'):
+            ok += 1
+            if cat[0] == 'L':
+                letters += 1
+
+    # Must be mostly printable/normal characters
+    if ok / n < 0.60:
+        return False
+
+    # Any 3+ char token with >=2 distinct letters counts as human
+    tokens = re.findall(r'\w{3,}', s2, flags=re.UNICODE)
+    for t in tokens:
+        t_letters = [c for c in t if unicodedata.category(c).startswith('L')]
+        if len(set(t_letters)) >= 2:
+            return True
+
+    # Fallback: enough letters overall
+    return (letters / n) >= 0.30
+
 
 def _wrap_hops(names: List[str], snrs_raw: List[Optional[int]], maxw: int,
                indent: str = "  ", hops_per_line: int = 1) -> List[str]:
@@ -210,6 +252,14 @@ def _msg_involves_node(msg: MessageInfo, node: NodeInfo, local_id: Optional[str]
 # ---------- Main app ----------
 
 class MeshTopApp:
+    def _wipe_body(self, stdscr, keep_header=True, keep_footer=True):
+        h, w = stdscr.getmaxyx()
+        start = 1 if keep_header else 0
+        end = h - 1 if keep_footer else h
+        for y in range(start, end):
+            stdscr.move(y, 0)
+            stdscr.clrtoeol()
+
     def _handle_trace_keys(self, ch):
         if ch in (ord('t'), ord('T')):
             if time.time() < self.trace_cooldown_end or self._trace_active():
@@ -345,6 +395,7 @@ class MeshTopApp:
         # ---- add these ----
         self.trace_deadline = 0.0
         self.trace_cooldown_end = 0.0
+        self._need_full_clear = False
 
     # ---------- Connection and initial load ----------
 
@@ -896,9 +947,8 @@ class MeshTopApp:
         h, w = stdscr.getmaxyx()
         maxw = w - 1
         top = 1
-        for i in range(1, h - 1):
-            stdscr.move(i, 0)
-            stdscr.clrtoeol()
+        self._wipe_body(stdscr)
+
         # snapshot trace state
         with self.trace_lock:
             tr = dict(self.trace_result) if self.trace_result is not None else {}
@@ -983,6 +1033,8 @@ class MeshTopApp:
         h, w = stdscr.getmaxyx()
         if h < 8 or w < 40:
             return
+        self._wipe_body(stdscr)
+
         maxw = w - 1
         top = 1
         rows_avail = h - 6  # leave space for log + footer
@@ -1123,6 +1175,8 @@ class MeshTopApp:
         h, w = stdscr.getmaxyx()
         maxw = w - 1
         top = 1
+        self._wipe_body(stdscr)
+
         rows_avail = h - 3  # rows available for messages (excluding header+footer)
 
         if not self.messages:
@@ -1268,7 +1322,9 @@ class MeshTopApp:
                 target = nodes_list[self.selected_node_index]
                 self.trace_target_num = target.num
                 self.view_mode = "TRACE"
+                self._need_full_clear = True  # <— add this
                 self._send_trace_to_current()
+
 
 
 
@@ -1377,6 +1433,12 @@ class MeshTopApp:
 
         while self.running:
             stdscr.erase()
+            # force a one-shot full clear if requested
+            if self._need_full_clear:
+                stdscr.clear()
+                stdscr.refresh()
+                self._need_full_clear = False
+
             h, w = stdscr.getmaxyx()
             # --- auto-timeout from TRACE ---
             if self.view_mode == "TRACE":
@@ -1458,10 +1520,13 @@ class MeshTopApp:
                 break
             if ch in (ord("m"), ord("M")):
                 self.view_mode = "MSGS"
+                self._need_full_clear = True
                 continue
             if ch in (ord("n"), ord("N")):
                 self.view_mode = "NODES"
+                self._need_full_clear = True
                 continue
+
             if self.view_mode == "NODES":
                 self._handle_nodes_keys(ch)
             elif self.view_mode == "TRACE":
