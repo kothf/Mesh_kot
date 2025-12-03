@@ -576,43 +576,65 @@ class MeshTopApp:
         if not d:
             return
 
-        # --- Handle traceroute responses (normalize portnum first) ---
+        # --- normalize portnum to a string name ---
         pn = d.get("portnum", "")
         try:
             if isinstance(pn, int):
-                pn_name = mesh_pb2.PortNum.Name(pn)  # e.g. 9 -> "TRACEROUTE_APP"
+                pn_name = mesh_pb2.PortNum.Name(pn)
             elif isinstance(pn, str):
                 pn_name = pn
             else:
                 pn_name = ""
         except Exception:
             pn_name = str(pn)
-        # If it's not a text message, don't show it in the log (still process traceroute above).
-        if pn_name and pn_name != "TEXT_MESSAGE_APP":
-            return
 
-        # ROUTING_APP may carry "NO_RESPONSE"
+        # ============================================================
+        # 1) HANDLE ROUTING/TRACEROUTE FIRST (populate self.trace_result)
+        # ============================================================
+
+        # Some firmwares send "NO_RESPONSE" via ROUTING_APP
         if pn_name == "ROUTING_APP":
             routing = d.get("routing", {})
             if routing.get("errorReason") == "NO_RESPONSE":
                 with self.trace_lock:
                     if self.trace_result and self.trace_result.get("dest_num") is not None:
                         self.trace_result["error"] = "NO_RESPONSE"
-                # let UI immediately allow retry
                 self.trace_deadline = 0.0
                 self.trace_cooldown_end = time.time() + 0.5
 
-        if pn_name == "TRACEROUTE_APP":
+        # Traceroute / RouteDiscovery can arrive under several names or even as a raw int
+        looks_like_trace = pn_name in {
+            "TRACEROUTE_APP", "ROUTE_DISCOVERY_APP", "TRACE_ROUTE_APP", "ROUTE_TRACE_APP"
+        } or (isinstance(pn, int) and pn in (9, 48, 49))  # 9 is TRACEROUTE_APP in current enums
+
+        if looks_like_trace:
             try:
                 payload = d.get("payload")
-                if isinstance(payload, (bytes, bytearray)):
+                rd_dict = None
+
+                # Case A: some builds include a decoded dict in the message
+                for k in ("routeDiscovery", "traceroute", "route_tracer", "route"):
+                    v = d.get(k)
+                    if isinstance(v, dict) and any(
+                            x in v for x in ("route", "snrTowards", "snrBack", "snr_forward", "snr_return")):
+                        rd_dict = v
+                        break
+
+                # Case B: payload is a protobuf RouteDiscovery
+                if rd_dict is None and isinstance(payload, (bytes, bytearray)):
                     rd = mesh_pb2.RouteDiscovery()
                     rd.ParseFromString(payload)
                     rd_dict = MessageToDict(rd)
 
-                    route = [int(x) for x in rd_dict.get("route", [])]
-                    snr_towards = [int(x) for x in rd_dict.get("snrTowards", [])] if "snrTowards" in rd_dict else []
-                    snr_back = [int(x) for x in rd_dict.get("snrBack", [])] if "snrBack" in rd_dict else []
+                if rd_dict:
+                    def _ints(v):
+                        if not v:
+                            return []
+                        return v if all(isinstance(x, int) for x in v) else [int(x) for x in v]
+
+                    route = _ints(rd_dict.get("route"))
+                    snr_towards = _ints(rd_dict.get("snrTowards") or rd_dict.get("snr_forward"))
+                    snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
 
                     far_end = route[-1] if route else packet.get("from")
                     with self.trace_lock:
@@ -624,21 +646,25 @@ class MeshTopApp:
                             "ts": time.time(),
                             "error": None,
                         }
-                    # success -> allow quick re-run
+                    # allow quick re-run
                     self.trace_deadline = 0.0
                     self.trace_cooldown_end = time.time() + 0.5
             except Exception as _e:
                 with self.trace_lock:
+                    self.trace_result = self.trace_result or {}
                     self.trace_result["error"] = f"PARSE ERROR: {_e}"
                 self.trace_deadline = 0.0
                 self.trace_cooldown_end = time.time() + 0.5
 
-                # continue; normal text handling below still runs if present
+        # ============================================================
+        # 2) AFTER traceroute handling, skip non-text for the message log
+        # ============================================================
+        if pn_name and pn_name != "TEXT_MESSAGE_APP":
+            return
 
-        # Plain text if present
+        # 3) Plain text for message log (with gibberish filter)
         text = d.get("text")
         if text is None:
-            # some builds only put bytes in payload
             payload = d.get("payload")
             if isinstance(payload, (bytes, bytearray)):
                 try:
@@ -651,6 +677,7 @@ class MeshTopApp:
         text = safe_text(text)
         if self.hide_gibberish and not looks_like_human_text(text):
             return
+
         from_num = packet.get("from")
         to_num = packet.get("to")
 
@@ -665,22 +692,24 @@ class MeshTopApp:
         direction = "IN"
         if self.local_num is not None and from_num == self.local_num:
             direction = "OUT"
-
         status = "RECEIVED" if direction == "IN" else "SENT"
 
-        msg = MessageInfo(
-            timestamp=time.time(),
-            direction=direction,
-            from_id=from_id,
-            from_short=from_short,
-            to_id=to_id,
-            to_short=to_short,
-            text=text,
-            portnum=d.get("portnum", ""),
-            status=status,
-            pkt_id=packet.get("id"),
+        self.messages.append(
+            MessageInfo(
+                timestamp=time.time(),
+                direction=direction,
+                from_id=from_id,
+                from_short=from_short,
+                to_id=to_id,
+                to_short=to_short,
+                text=text,
+                portnum=d.get("portnum", ""),
+                status=status,
+                pkt_id=packet.get("id"),
+            )
         )
-        self.messages.append(msg)
+
+        # best-effort archive
         try:
             self.archiver.write({
                 'ts_iso': MessageArchiver.now_iso(),
@@ -698,9 +727,8 @@ class MeshTopApp:
                 'channel': packet.get('channel', 0),
                 'errors': []
             })
-        except Exception as _e:
-            import sys
-            print(f"[archiver] inbound log failed: {_e}", file=sys.stderr)
+        except Exception:
+            pass
 
     # ---------- Sending text ----------
 
