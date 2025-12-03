@@ -7,6 +7,11 @@ import threading
 import json
 from meshtastic import mesh_pb2
 from google.protobuf.json_format import MessageToDict
+import logging
+logging.getLogger("meshtastic").setLevel(logging.WARNING)
+logging.getLogger("pubsub").setLevel(logging.WARNING)
+import re
+import unicodedata
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +71,40 @@ class MessageInfo:
 
 
 # ---------- Helpers ----------
+def looks_like_human_text(s: str) -> bool:
+    """
+    Keep real text in any language. Drop binary-ish noise.
+    - Accept letters/numbers from all scripts, whitespace, punctuation & symbols.
+    - Reject if too many 'other' chars or very long repeated runs.
+    """
+    if not s:
+        return False
+    n = len(s)
+
+    # long repeated runs of the same char (e.g., "%%%%%%%%%%%%%")
+    if re.search(r'(.)\1{8,}', s):
+        return False
+
+    letters = digits = ok = 0
+    for ch in s:
+        cat = unicodedata.category(ch)  # e.g. 'Ll', 'Nd', 'Zs', 'Po', 'So'
+        if cat[0] in ('L', 'N'):      # letters & numbers — keep (all languages)
+            letters += (cat[0] == 'L')
+            digits  += (cat[0] == 'N')
+            ok += 1
+        elif cat[0] in ('Z', 'P', 'S'):  # spaces, punctuation, symbols (includes emoji)
+            ok += 1
+        elif ch in '\t':
+            ok += 1
+
+    # Heuristics:
+    ratio_ok = ok / n
+    ratio_letters = letters / n
+    # If most chars are acceptable, and at least a few are letters, keep it
+    if ratio_ok >= 0.70 and (letters >= 3 or ratio_letters >= 0.15):
+        return True
+    return False
+
 def _wrap_hops(names: List[str], snrs_raw: List[Optional[int]], maxw: int,
                indent: str = "  ", hops_per_line: int = 1) -> List[str]:
     """
@@ -251,6 +290,8 @@ class MeshTopApp:
         self.trace_thread.start()
 
     def __init__(self, host: str, port: int = 4403):
+        self.hide_gibberish = True  # default on; press 'g' to toggle
+
         # --- trace timing (auto-timeout + cooldown) ---
         self.trace_timeout_sec = 30.0  # how long we wait for a result
         self.trace_cooldown_sec = 3.0  # minimum pause between traces
@@ -546,6 +587,9 @@ class MeshTopApp:
                 pn_name = ""
         except Exception:
             pn_name = str(pn)
+        # If it's not a text message, don't show it in the log (still process traceroute above).
+        if pn_name and pn_name != "TEXT_MESSAGE_APP":
+            return
 
         # ROUTING_APP may carry "NO_RESPONSE"
         if pn_name == "ROUTING_APP":
@@ -605,7 +649,8 @@ class MeshTopApp:
             return
 
         text = safe_text(text)
-
+        if self.hide_gibberish and not looks_like_human_text(text):
+            return
         from_num = packet.get("from")
         to_num = packet.get("to")
 
@@ -823,7 +868,9 @@ class MeshTopApp:
         h, w = stdscr.getmaxyx()
         maxw = w - 1
         top = 1
-
+        for i in range(1, h - 1):
+            stdscr.move(i, 0)
+            stdscr.clrtoeol()
         # snapshot trace state
         with self.trace_lock:
             tr = dict(self.trace_result) if self.trace_result is not None else {}
@@ -1338,7 +1385,10 @@ class MeshTopApp:
                     self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, q quit)")
                     self._draw_trace_view(stdscr)
                 else:
-                    self._draw_header(stdscr, "meshtop – MESSAGES (n nodes, q quit)")
+                    # where you draw the MESSAGES header:
+                    self._draw_header(stdscr,
+                                      f"meshtop – MESSAGES (n nodes, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+
                     self._draw_messages_view(stdscr)
 
                 maxw = w - 1
@@ -1355,7 +1405,10 @@ class MeshTopApp:
                     self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, q quit)")
                     self._draw_trace_view(stdscr)
                 else:
-                    self._draw_header(stdscr, "meshtop – MESSAGES (n nodes, q quit)")
+                    # where you draw the MESSAGES header:
+                    self._draw_header(stdscr,
+                                      f"meshtop – MESSAGES (n nodes, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+
                     self._draw_messages_view(stdscr)
 
 
@@ -1367,6 +1420,9 @@ class MeshTopApp:
 
             if self.input_mode:
                 self._handle_input_char(ch)
+                continue
+            if ch in (ord('g'), ord('G')):
+                self.hide_gibberish = not self.hide_gibberish
                 continue
 
             if ch in (ord("q"), ord("Q")):
