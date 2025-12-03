@@ -3,11 +3,14 @@ import argparse
 import curses
 import math
 import time
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from pubsub import pub
 from meshtastic.tcp_interface import TCPInterface
+from archiver import MessageArchiver
 
 
 # ---------- Data classes ----------
@@ -15,7 +18,7 @@ from meshtastic.tcp_interface import TCPInterface
 @dataclass
 class NodeInfo:
     num: int
-    node_id: str = ""          # "!abcd1234"
+    node_id: str = ""  # "!abcd1234"
     short_name: str = "?"
     long_name: str = "?"
     hw_model: str = "?"
@@ -46,7 +49,7 @@ class NodeInfo:
 @dataclass
 class MessageInfo:
     timestamp: float
-    direction: str          # "IN" or "OUT"
+    direction: str  # "IN" or "OUT"
     from_id: str
     from_short: str
     to_id: str
@@ -66,10 +69,10 @@ def haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = (
-        math.sin(dlat / 2) ** 2
-        + math.cos(math.radians(lat1))
-        * math.cos(math.radians(lat2))
-        * math.sin(dlon / 2) ** 2
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
     )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
@@ -101,6 +104,11 @@ class MeshTopApp:
         self.nodes: Dict[int, NodeInfo] = {}
         self.messages: List[MessageInfo] = []
 
+        # message archiver
+        self.archiver = MessageArchiver(max_size_mib=5)
+        # load recent history (up to 1000 lines)
+        self._load_archived_messages(max_lines=1000)
+
         # local node info (static)
         self.local_num: Optional[int] = None
         self.local_id: Optional[str] = None
@@ -111,7 +119,7 @@ class MeshTopApp:
 
         # UI state
         self.running = True
-        self.view_mode = "NODES"    # or "MSGS"
+        self.view_mode = "NODES"  # or "MSGS"
         self.selected_node_index = 0
         self.selected_msg_index = 0
 
@@ -210,7 +218,7 @@ class MeshTopApp:
 
             # mark local node
             if (self.local_num is not None and num == self.local_num) or \
-               (self.local_id and node.node_id == self.local_id):
+                    (self.local_id and node.node_id == self.local_id):
                 node.is_me = True
                 self.local_num = num
                 if self.local_id is None:
@@ -398,10 +406,52 @@ class MeshTopApp:
             pkt_id=packet.get("id"),
         )
         self.messages.append(msg)
+        try:
+            self.archiver.write({
+                'ts_iso': MessageArchiver.now_iso(),
+                'direction': 'IN' if status == 'RECEIVED' else 'OUT',
+                'from_id': from_id,
+                'from_name': from_short,
+                'to_id': to_id,
+                'broadcast': False,
+                'text': text,
+                'msg_id': packet.get('id'),
+                'ack': (status == 'RECEIVED' and d.get('requestId') is None),
+                'hop_limit': packet.get('hopLimit'),
+                'rssi': packet.get('rxRssi'),
+                'snr': packet.get('rxSnr'),
+                'channel': packet.get('channel', 0),
+                'errors': []
+            })
+        except Exception as _e:
+            import sys
+            print(f"[archiver] inbound log failed: {_e}", file=sys.stderr)
 
     # ---------- Sending text ----------
 
     def send_text_to_node(self, target_num: int, text: str):
+        # best-effort outbound log (pre-send)
+        try:
+            to_id = self.nodes.get(target_num).node_id if self.nodes.get(target_num) else f'#{target_num}'
+            self.archiver.write({
+                'ts_iso': MessageArchiver.now_iso(),
+                'direction': 'OUT',
+                'from_id': self.local_id or '^local',
+                'from_name': self.local_short,
+                'to_id': to_id,
+                'broadcast': False,
+                'text': text,
+                'msg_id': None,
+                'ack': False,
+                'hop_limit': None,
+                'rssi': None,
+                'snr': None,
+                'channel': 0,
+                'errors': []
+            })
+        except Exception as _e:
+            import sys
+            print(f"[archiver] outbound pre-log failed: {_e}", file=sys.stderr)
         if not self.iface:
             return
         node = self.nodes.get(target_num)
@@ -492,7 +542,40 @@ class MeshTopApp:
             text = safe_text(msg.text)[:text_space]
 
             line = (prefix + text).ljust(maxw)
+            # highlight messages addressed to my node in BLUE (MESSAGES view only)
+            to_me = False
+            try:
+                # Normalize IDs (strip leading '!' or '#')
+                def _norm(x):
+                    return (str(x) if x is not None else '').replace('!', '').replace('#', '')
+
+                # If direction is IN, it's a message delivered to *me* via the mesh
+                if (msg.direction or '').upper() == 'IN':
+                    to_me = True
+                # Or explicit address matches my node
+                elif _norm(msg.to_id) and _norm(self.local_id) and _norm(msg.to_id) == _norm(self.local_id):
+                    to_me = True
+                elif self.local_num is not None and _norm(msg.to_id) == _norm(self.local_num):
+                    to_me = True
+                elif msg.to_short and self.local_short and msg.to_short == self.local_short:
+                    to_me = True
+            except Exception:
+                to_me = False
+            # draw first, then colorize with chgat for better terminal compatibility
             stdscr.addnstr(row_y, 0, line, maxw)
+            if self.view_mode == "MSGS" and to_me:
+                if curses.has_colors():
+                    try:
+                        stdscr.chgat(row_y, 0, -1, curses.color_pair(4) | curses.A_BOLD)
+                        stdscr.refresh()
+                    except curses.error:
+                        # fallback to inline attribute if chgat fails
+                        stdscr.addnstr(row_y, 0, line, maxw, curses.color_pair(4) | curses.A_BOLD)
+                        stdscr.refresh()
+                else:
+                    # no-color fallback marker
+                    line2 = (">> " + (prefix + text))[:maxw].ljust(maxw)
+                    stdscr.addnstr(row_y, 0, line2, maxw)
 
     # ---------- NODES view ----------
 
@@ -780,15 +863,93 @@ class MeshTopApp:
 
     # ---------- curses main loop ----------
 
+    def _load_archived_messages(self, max_lines: int = 1000):
+        """
+        Load recent messages from JSONL archives in the current directory
+        and prepend them to self.messages as historical context.
+        """
+        try:
+            base_dir = Path(__file__).resolve().parent
+        except Exception:
+            base_dir = Path(".").resolve()
+        files = sorted(list(base_dir.glob("messages.jsonl")) + list(base_dir.glob("messages.*.jsonl")))
+        if not files:
+            return
+        # Read from newest to oldest until max_lines collected
+        needed = max_lines
+        buf = []
+        for f in reversed(files):
+            try:
+                with f.open("r", encoding="utf-8", errors="replace") as fh:
+                    # Efficiently collect last N lines from each file if still needed
+                    lines = fh.readlines()
+                    if not lines:
+                        continue
+                    take = min(len(lines), needed)
+                    buf.extend(lines[-take:])
+                    needed -= take
+                    if needed <= 0:
+                        break
+            except Exception:
+                continue
+
+        # Oldest first for chronological order
+        buf = buf[-max_lines:]
+        for line in buf:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            # Map to MessageInfo
+            direction = rec.get("direction", "in").upper()
+            from_id = rec.get("from_id") or "^unknown"
+            to_id = rec.get("to_id") or "^unknown"
+            from_short = rec.get("from_name") or from_id
+            to_short = rec.get("to_name") or to_id
+            text = rec.get("text") or ""
+            ts = rec.get("ts_iso")
+            # convert ts to epoch if present
+            try:
+                import datetime
+                from datetime import datetime as _dt
+                # Attempt parsing ISO
+                if isinstance(ts, str):
+                    if ts.endswith("Z"):
+                        ts = ts[:-1] + "+00:00"
+                    epoch = _dt.fromisoformat(ts).timestamp()
+                else:
+                    epoch = time.time()
+            except Exception:
+                epoch = time.time()
+            msg = MessageInfo(
+                timestamp=epoch,
+                direction=direction,
+                from_id=from_id,
+                from_short=from_short,
+                to_id=to_id,
+                to_short=to_short,
+                text=safe_text(text),
+                portnum="TEXT_MESSAGE_APP",
+                status="RECEIVED" if direction == "IN" else "SENT",
+                pkt_id=rec.get("msg_id")
+            )
+            self.messages.append(msg)
+
     def run_curses(self, stdscr):
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(200)
 
-        curses.start_color()
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)    # low battery
-        curses.init_pair(3, curses.COLOR_YELLOW, -1) # my node
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            # init pairs (use 4 for blue to avoid clashes)
+            try:
+                curses.init_pair(1, curses.COLOR_RED, -1)  # low battery
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)  # my node
+                curses.init_pair(4, curses.COLOR_BLUE, -1)  # messages to me (pair 4)
+            except curses.error:
+                pass
 
         while self.running:
             stdscr.erase()
