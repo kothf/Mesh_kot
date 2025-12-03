@@ -92,6 +92,10 @@ def safe_text(s: str) -> str:
         out_chars.append(ch)
     return "".join(out_chars)
 
+def _norm(x) -> str:
+    """Normalize Meshtastic IDs: strip '!' / '#' and ensure string."""
+    return (str(x) if x is not None else '').replace('!', '').replace('#', '')
+
 
 # ---------- Main app ----------
 
@@ -541,41 +545,30 @@ class MeshTopApp:
             text_space = max(10, maxw - len(prefix) - 1)
             text = safe_text(msg.text)[:text_space]
 
+            # build the rendered line
+            # build the rendered line
+            # build the rendered line
             line = (prefix + text).ljust(maxw)
-            # highlight messages addressed to my node in BLUE (MESSAGES view only)
-            to_me = False
-            try:
-                # Normalize IDs (strip leading '!' or '#')
-                def _norm(x):
-                    return (str(x) if x is not None else '').replace('!', '').replace('#', '')
 
-                # If direction is IN, it's a message delivered to *me* via the mesh
-                if (msg.direction or '').upper() == 'IN':
+            # highlight "to me" rows using the SAME mechanism as NODES (pair 3)
+            # highlight ONLY messages explicitly sent TO *my* node
+            attrs = 0
+            to_me = False
+            if (msg.direction or "").upper() == "IN":  # must be inbound
+                norm_to = _norm(msg.to_id)
+                if (self.local_id and norm_to == _norm(self.local_id)) \
+                        or (self.local_num is not None and norm_to == str(self.local_num)) \
+                        or ((msg.to_short or "") and (self.local_short or "") and msg.to_short == self.local_short):
                     to_me = True
-                # Or explicit address matches my node
-                elif _norm(msg.to_id) and _norm(self.local_id) and _norm(msg.to_id) == _norm(self.local_id):
-                    to_me = True
-                elif self.local_num is not None and _norm(msg.to_id) == _norm(self.local_num):
-                    to_me = True
-                elif msg.to_short and self.local_short and msg.to_short == self.local_short:
-                    to_me = True
-            except Exception:
-                to_me = False
-            # draw first, then colorize with chgat for better terminal compatibility
-            stdscr.addnstr(row_y, 0, line, maxw)
-            if self.view_mode == "MSGS" and to_me:
-                if curses.has_colors():
-                    try:
-                        stdscr.chgat(row_y, 0, -1, curses.color_pair(4) | curses.A_BOLD)
-                        stdscr.refresh()
-                    except curses.error:
-                        # fallback to inline attribute if chgat fails
-                        stdscr.addnstr(row_y, 0, line, maxw, curses.color_pair(4) | curses.A_BOLD)
-                        stdscr.refresh()
-                else:
-                    # no-color fallback marker
-                    line2 = (">> " + (prefix + text))[:maxw].ljust(maxw)
-                    stdscr.addnstr(row_y, 0, line2, maxw)
+
+            # only color in the full MESSAGES window; reuse pair(3) that already works in NODES
+            if self.view_mode == "MSGS" and to_me and curses.has_colors():
+                attrs |= curses.color_pair(3) | curses.A_BOLD
+
+            # IMPORTANT: pass attrs as the 5th argument
+            stdscr.addnstr(row_y, 0, line, maxw, attrs)
+
+
 
     # ---------- NODES view ----------
 
@@ -804,6 +797,19 @@ class MeshTopApp:
             text_space = max(10, maxw - len(line_prefix) - 1)
             text = safe_text(msg.text)[:text_space]
             line = (line_prefix + text).ljust(maxw)
+
+            # highlight "to me" using the SAME attrs pattern you use in NODES
+            # highlight ONLY messages explicitly sent TO *my* node
+            to_me = False
+            if (msg.direction or "").upper() == "IN":  # must be inbound
+                norm_to = _norm(msg.to_id)
+                if (self.local_id and norm_to == _norm(self.local_id)) \
+                        or (self.local_num is not None and norm_to == str(self.local_num)) \
+                        or ((msg.to_short or "") and (self.local_short or "") and msg.to_short == self.local_short):
+                    to_me = True
+
+            if curses.has_colors() and to_me:
+                attrs |= curses.color_pair(3) | curses.A_BOLD
 
             stdscr.addnstr(row_y, 0, line, maxw, attrs)
 
