@@ -114,9 +114,10 @@ class MeshTopApp:
         self.view_mode = "NODES"    # or "MSGS"
         self.selected_node_index = 0
         self.selected_msg_index = 0
-        
-        # ADDED: Scroll offset for the nodes list
+
+        # scrolling offsets
         self.node_view_offset = 0
+        self.msg_view_offset = 0
 
         self.input_mode = False
         self.input_text = ""
@@ -515,7 +516,7 @@ class MeshTopApp:
             self.node_view_offset = self.selected_node_index
         elif self.selected_node_index >= self.node_view_offset + rows_avail:
             self.node_view_offset = self.selected_node_index - rows_avail + 1
-        
+
         # 3. Clamp the offset
         if len(nodes_list) <= rows_avail:
             self.node_view_offset = 0
@@ -560,13 +561,13 @@ class MeshTopApp:
         stdscr.attroff(curses.A_BOLD)
 
         # Slice the list based on offset
-        visible_nodes = nodes_list[self.node_view_offset : self.node_view_offset + rows_avail]
+        visible_nodes = nodes_list[self.node_view_offset:self.node_view_offset + rows_avail]
 
         for i, node in enumerate(visible_nodes):
             row_y = top + 1 + i
             if row_y >= h - 4:
                 break
-            
+
             # The 'real' index in the full list
             real_index = self.node_view_offset + i
 
@@ -639,29 +640,72 @@ class MeshTopApp:
         h, w = stdscr.getmaxyx()
         maxw = w - 1
         top = 1
-        rows_avail = h - 3
+        rows_avail = h - 3  # rows available for messages (excluding header+footer)
 
         if not self.messages:
-            stdscr.addnstr(top, 0,
-                           "(no messages yet – send from NODES view)".ljust(maxw),
-                           maxw)
+            stdscr.addnstr(
+                top,
+                0,
+                "(no messages yet – send from NODES view)".ljust(maxw),
+                maxw,
+            )
             footer = "[n] nodes view  [q] quit"
             stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
             return
 
-        msgs = self.messages[-200:]
-        if self.selected_msg_index >= len(msgs):
-            self.selected_msg_index = max(0, len(msgs) - 1)
+        # Work with the full list (or cap to last 1000 for sanity)
+        msgs = self.messages[-1000:]
+        total = len(msgs)
 
-        start_index = max(0, len(msgs) - rows_avail)
-        visible = msgs[start_index:]
+        # selected_msg_index is relative to full self.messages; remap if needed
+        # If messages was truncated to last 1000, we also adjust selection
+        global_total = len(self.messages)
+        if global_total > 1000:
+            # The oldest of 'msgs' corresponds to index (global_total - 1000)
+            base_index = global_total - 1000
+            # Clamp selected index into [base_index, global_total-1]
+            if self.selected_msg_index < base_index:
+                self.selected_msg_index = base_index
+            if self.selected_msg_index >= global_total:
+                self.selected_msg_index = global_total - 1
+            # local index inside msgs
+            selected_local = self.selected_msg_index - base_index
+        else:
+            # 1-1 mapping
+            if self.selected_msg_index >= global_total:
+                self.selected_msg_index = max(0, global_total - 1)
+            selected_local = self.selected_msg_index
+
+        # Now 'selected_local' is index into msgs[]
+        # SCROLLING: adjust msg_view_offset so selected is visible
+        if selected_local < self.msg_view_offset:
+            self.msg_view_offset = selected_local
+        elif selected_local >= self.msg_view_offset + rows_avail:
+            self.msg_view_offset = selected_local - rows_avail + 1
+
+        # Clamp msg_view_offset
+        if total <= rows_avail:
+            self.msg_view_offset = 0
+        else:
+            max_offset = total - rows_avail
+            if self.msg_view_offset > max_offset:
+                self.msg_view_offset = max_offset
+
+        visible = msgs[self.msg_view_offset:self.msg_view_offset + rows_avail]
 
         for i, msg in enumerate(visible):
             row_y = top + i
             if row_y >= h - 1:
                 break
-            idx = start_index + i
-            selected = (idx == self.selected_msg_index)
+
+            # figure out whether this row is the selected row
+            if global_total > 1000:
+                base_index = global_total - 1000
+                msg_global_index = base_index + self.msg_view_offset + i
+            else:
+                msg_global_index = self.msg_view_offset + i
+
+            selected = (msg_global_index == self.selected_msg_index)
 
             attrs = curses.A_NORMAL
             if selected:
@@ -680,7 +724,7 @@ class MeshTopApp:
 
             stdscr.addnstr(row_y, 0, line, maxw, attrs)
 
-        footer = "[↑↓] select  [n] nodes view  [q] quit"
+        footer = "[↑↓] scroll / select  [n] nodes view  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- Input handling ----------
@@ -725,13 +769,14 @@ class MeshTopApp:
                 self._start_input(target.num)
 
     def _handle_msgs_keys(self, ch):
-        msgs = self.messages[-200:]
+        total = len(self.messages)
+        if total == 0:
+            return
+
         if ch == curses.KEY_UP:
             self.selected_msg_index = max(0, self.selected_msg_index - 1)
         elif ch == curses.KEY_DOWN:
-            self.selected_msg_index = min(
-                max(0, len(msgs) - 1), self.selected_msg_index + 1
-            )
+            self.selected_msg_index = min(total - 1, self.selected_msg_index + 1)
 
     # ---------- curses main loop ----------
 
