@@ -710,8 +710,8 @@ class MeshTopApp:
                     snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
 
                     far_end = route[-1] if route else packet.get("from")
-                    if far_end is not None:
-                        node = self._get_or_create_node(far_end)
+                    for num_to_update in set(filter(None, [far_end, self.trace_target_num])):
+                        node = self._get_or_create_node(num_to_update)
                         node.last_route = route
                         node.last_route_snr_towards = snr_towards
                         node.last_route_snr_back = snr_back
@@ -949,29 +949,6 @@ class MeshTopApp:
 
 
 
-    # ---------- NODES view ----------
-    def _format_hops_table(self, names: List[str], snrs_raw: List[Optional[int]], maxw: int, title: str) -> List[str]:
-        def snr_txt(i: int) -> str:
-            if i >= len(snrs_raw) or snrs_raw[i] in (None, -128):
-                return "? dB"
-            return f"{snrs_raw[i] / 4.0:.1f} dB"
-
-        col_no, col_from, col_to, col_snr = 3, 14, 14, 8
-        rule = "─" * min(maxw, col_no + 1 + col_from + 1 + 1 + 1 + col_to + 2 + col_snr)
-        lines = [title[:maxw], rule]
-
-        for i in range(len(names) - 1):
-            left = names[i][:col_from].ljust(col_from)
-            right = names[i + 1][:col_to].ljust(col_to)
-            snr = snr_txt(i).rjust(col_snr)
-            row = f"{str(i + 1).rjust(col_no - 1)} {left} → {right}  {snr}"
-            lines.append(row[:maxw])
-
-        if len(names) == 1:
-            lines.append(f"{'1'.rjust(col_no - 1)} {names[0][:col_from].ljust(col_from)}")
-
-        return lines
-
     def _draw_trace_view(self, stdscr):
         h, w = stdscr.getmaxyx()
         maxw = w - 1
@@ -981,9 +958,6 @@ class MeshTopApp:
         # snapshot trace state
         with self.trace_lock:
             tr = dict(self.trace_result) if self.trace_result is not None else {}
-
-
-
 
         if self.trace_target_num is None or self.trace_target_num not in self.nodes:
             stdscr.addnstr(top, 0, "No node selected for trace.".ljust(maxw), maxw)
@@ -1005,12 +979,9 @@ class MeshTopApp:
         route = tr.get("route", []) or []
         snr_fwd = tr.get("snr_towards", []) or []
         snr_back = tr.get("snr_back", []) or []
-        err = tr.get("error")
 
         y = top + 3
 
-        # Waiting / Error
-        # Waiting / Error / Zero-hop
         if err:
             stdscr.addnstr(y, 0, f"Error: {err}".ljust(maxw), maxw)
             y += 1
@@ -1019,7 +990,6 @@ class MeshTopApp:
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
         elif route is not None and len(route) == 0:
-            # Treat zero hops as "no trace result yet" to avoid showing any table.
             remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
             stdscr.addnstr(y, 0, f"Waiting for trace… (~{remain:.1f}s left)".ljust(maxw), maxw)
             y += 1
@@ -1027,10 +997,7 @@ class MeshTopApp:
             y += 1
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
-
-
         elif not route:
-            # Still waiting for a non-empty route
             remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
             stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
             y += 2
@@ -1044,32 +1011,49 @@ class MeshTopApp:
             n = int(n)
             if n in self.nodes:
                 nn = self.nodes[n]
-                return nn.short_name or nn.node_id or f"#{n}"
+                return f"{nn.short_name or nn.node_id or f'#{n}'}"
             return f"#{n}"
 
         names = [name_from_num(n) for n in route]
         if self.local_num is not None and route and route[0] == self.local_num:
             names[0] = self.local_short or "ME"
 
-        # To destination
-        # To destination
+        # Draw vertical path
+        stdscr.addnstr(y, 0, "Trace Path Discovery:".ljust(maxw), maxw, curses.A_BOLD)
+        y += 2
 
-        for line in self._format_hops_table(names, snr_fwd, maxw, "Route to destination"):
-            stdscr.addnstr(y, 0, line.ljust(maxw), maxw);
+        for i in range(len(names)):
+            if y >= h - 2:
+                break
+            stdscr.addnstr(y, 2, f"[ {names[i]} ]", maxw)
             y += 1
 
-        y += 1
+            if i < len(names) - 1:
+                # Forward SNR
+                fwd_val = snr_fwd[i] if i < len(snr_fwd) else None
+                fwd_txt = f"{fwd_val / 4.0:+.1f} dB" if (fwd_val is not None and fwd_val != -128) else "? dB"
 
-        stdscr.addnstr(y, 0, "Route back to us".ljust(maxw), maxw, curses.A_BOLD);
-        y += 1
-        if snr_back and len(names) >= 2:
-            back_names = list(reversed(names))
-            for line in self._format_hops_table(back_names, snr_back, maxw, ""):
-                stdscr.addnstr(y, 0, line.ljust(maxw), maxw);
+                # Backward SNR
+                back_idx = len(names) - 2 - i
+                back_val = snr_back[back_idx] if (back_idx >= 0 and back_idx < len(snr_back)) else None
+                back_txt = f"{back_val / 4.0:+.1f} dB" if (back_val is not None and back_val != -128) else "? dB"
+
+                if y >= h - 2:
+                    break
+                stdscr.addnstr(y, 2, "   │", maxw)
                 y += 1
-        else:
-            stdscr.addnstr(y, 0, "  (no return SNRs reported)".ljust(maxw), maxw);
-            y += 1
+
+                if y >= h - 2:
+                    break
+                stdscr.addnstr(y, 2, f"   │   fwd: {fwd_txt}  │  back: {back_txt}", maxw)
+                y += 1
+
+                if y >= h - 2:
+                    break
+                stdscr.addnstr(y, 2, "   ▼", maxw)
+                y += 1
+
+        stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
 
     def _draw_nodes_view(self, stdscr):
         h, w = stdscr.getmaxyx()
