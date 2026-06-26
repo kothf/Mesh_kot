@@ -425,6 +425,7 @@ class MeshTopApp:
 
     # ---------- Connection and initial load ----------
 
+    def connect(self):
         self.iface = TCPInterface(self.host, portNumber=self.port)
 
         # Suppress meshtastic library print output from traceroutes by stubbing/wrapping onResponseTraceRoute
