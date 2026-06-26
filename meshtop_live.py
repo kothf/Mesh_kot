@@ -55,6 +55,20 @@ class NodeInfo:
     is_me: bool = False
     battery_low: bool = False
 
+    last_route: Optional[List[int]] = None
+    last_route_snr_towards: Optional[List[int]] = None
+    last_route_snr_back: Optional[List[int]] = None
+    last_route_time: Optional[float] = None
+
+    _app_instance = None
+
+    def trace(self, switch_view: bool = False):
+        """Programmatic trace call to trigger a traceroute for this node."""
+        if NodeInfo._app_instance:
+            NodeInfo._app_instance.trigger_trace_to_node(self.num, switch_view=switch_view)
+        else:
+            raise RuntimeError("No active MeshTopApp instance registered.")
+
 
 @dataclass
 class MessageInfo:
@@ -339,7 +353,15 @@ class MeshTopApp:
         )
         self.trace_thread.start()
 
+    def trigger_trace_to_node(self, node_num: int, switch_view: bool = True):
+        self.trace_target_num = node_num
+        if switch_view:
+            self.view_mode = "TRACE"
+            self._need_full_clear = True
+        self._send_trace_to_current()
+
     def __init__(self, host: str, port: int = 4403):
+        NodeInfo._app_instance = self
         self.hide_gibberish = True  # default on; press 'g' to toggle
 
         # --- trace timing (auto-timeout + cooldown) ---
@@ -688,6 +710,13 @@ class MeshTopApp:
                     snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
 
                     far_end = route[-1] if route else packet.get("from")
+                    if far_end is not None:
+                        node = self._get_or_create_node(far_end)
+                        node.last_route = route
+                        node.last_route_snr_towards = snr_towards
+                        node.last_route_snr_back = snr_back
+                        node.last_route_time = time.time()
+
                     with self.trace_lock:
                         self.trace_result = {
                             "dest_num": far_end,
@@ -1050,7 +1079,7 @@ class MeshTopApp:
 
         maxw = w - 1
         top = 1
-        rows_avail = h - 6  # leave space for log + footer
+        rows_avail = h - 7  # leave space for log + footer + route info
 
         nodes_list = list(self.nodes.values())
         nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
@@ -1082,6 +1111,7 @@ class MeshTopApp:
             ("RSSI", 6),
             ("SNR", 5),
             ("Hop", 5),
+            ("Route", 12),
             ("Bat%", 6),
             ("V", 5),
             ("ChU%", 6),
@@ -1113,7 +1143,7 @@ class MeshTopApp:
 
         for i, node in enumerate(visible_nodes):
             row_y = top + 1 + i
-            if row_y >= h - 4:
+            if row_y >= h - 5:
                 break
 
             # The 'real' index in the full list
@@ -1137,6 +1167,17 @@ class MeshTopApp:
             hop_str = "--"
             if node.hop_limit is not None and node.hop_start is not None:
                 hop_str = f"{node.hop_start - node.hop_limit:>2}"
+
+            route_str = "--"
+            if getattr(node, "last_route", None):
+                names = []
+                for n in node.last_route:
+                    if n in self.nodes:
+                        names.append(self.nodes[n].short_name or "?")
+                    else:
+                        names.append("?")
+                route_str = ">".join(names)
+
             bat_str = f"{node.battery:>3}%" if node.battery is not None else " --%"
             v_str = f"{node.voltage:.2f}" if node.voltage is not None else " -- "
             chu_str = f"{node.channel_util:4.1f}" if node.channel_util is not None else " -- "
@@ -1154,6 +1195,7 @@ class MeshTopApp:
                 rssi_str,
                 snr_str,
                 hop_str,
+                route_str,
                 bat_str,
                 v_str,
                 chu_str,
@@ -1170,16 +1212,52 @@ class MeshTopApp:
                 stdscr.addnstr(row_y, x, safe_text(str(val))[:wd].ljust(wd), wd, attrs)
                 x += wd + 1
 
-        topo_row = h - 4
+        topo_row = h - 5
         if self.local_lat is None or self.local_lon is None:
             msg = "(my position unknown – Dist will stay --)"
         else:
             msg = f"My position: {self.local_lat:.5f}, {self.local_lon:.5f}"
         stdscr.addnstr(topo_row, 0, msg.ljust(maxw), maxw)
 
+        route_info_row = h - 4
+        selected_node = nodes_list[self.selected_node_index] if nodes_list else None
+        if selected_node and getattr(selected_node, "last_route", None):
+            hops_names = []
+            for n in selected_node.last_route:
+                if n in self.nodes:
+                    nn = self.nodes[n]
+                    hops_names.append(f"{nn.short_name or nn.node_id or f'#{n}'}")
+                else:
+                    hops_names.append(f"#{n}")
+            route_path = " → ".join(hops_names)
+
+            snr_fwd = getattr(selected_node, "last_route_snr_towards", []) or []
+            snr_back = getattr(selected_node, "last_route_snr_back", []) or []
+            snr_str = ""
+            if snr_fwd:
+                snr_str += f" (fwd: {', '.join(map(str, snr_fwd))}"
+            if snr_back:
+                if snr_str:
+                    snr_str += f" | back: {', '.join(map(str, snr_back))})"
+                else:
+                    snr_str += f" (back: {', '.join(map(str, snr_back))})"
+            else:
+                if snr_str:
+                    snr_str += ")"
+
+            ts_str = ""
+            if getattr(selected_node, "last_route_time", None):
+                ago = int(time.time() - selected_node.last_route_time)
+                ts_str = f" [{ago}s ago]"
+
+            route_msg = f"Last Route to {selected_node.short_name or selected_node.node_id}: {route_path}{snr_str}{ts_str}"
+        else:
+            route_msg = "Last Route: (no trace route recorded yet for selected node)"
+        stdscr.addnstr(route_info_row, 0, route_msg.ljust(maxw), maxw)
+
         self._draw_message_log(stdscr, start_row=h - 3, max_rows=2)
 
-        footer = "[↑↓] select node  [Enter] send  [m] messages  [q] quit"
+        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] messages  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- MESSAGES view ----------
