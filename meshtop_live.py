@@ -179,7 +179,7 @@ def _wrap_hops(names: List[str], snrs_raw: List[Optional[int]], maxw: int,
     count = 0
 
     for i in range(len(names) - 1):
-        piece = f"[{names[i]}] → [{names[i+1]}] ({db(i)})"
+        piece = f"[{names[i]}] -> [{names[i+1]}] ({db(i)})"
         # hard wrap if the next piece would exceed screen width
         next_buf = (buf + ("" if count == 0 else "  ") + piece)
         if count and (len(next_buf) > maxw or count >= hops_per_line):
@@ -281,6 +281,7 @@ class MeshTopApp:
                     remain = max(0, int(self.trace_cooldown_end - time.time()))
                     self.trace_result = self.trace_result or {}
                     self.trace_result["error"] = f"TRACE busy (wait {remain}s)"
+                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
                 return
             self._send_trace_to_current()
 
@@ -300,6 +301,7 @@ class MeshTopApp:
             with self.trace_lock:
                 if self.trace_result is not None:
                     self.trace_result["error"] = f"TRACE SEND ERROR: {e}"
+                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
 
     def _trace_active(self) -> bool:
         """True while we're waiting for a result and haven't timed out yet."""
@@ -329,6 +331,7 @@ class MeshTopApp:
                 remain = max(0, int(self.trace_cooldown_end - now))
                 self.trace_result = self.trace_result or {}
                 self.trace_result["error"] = f"TRACE suppressed (cooldown {remain}s)"
+                self.trace_result["elapsed"] = now - (self.trace_started_at or now)
             return
 
         # seed UI state
@@ -340,6 +343,7 @@ class MeshTopApp:
                 "snr_back": [],
                 "ts": now,
                 "error": None,
+                "elapsed": None,
             }
 
         # set timeout and cooldown windows
@@ -723,8 +727,9 @@ class MeshTopApp:
                             "route": route,
                             "snr_towards": snr_towards,
                             "snr_back": snr_back,
-                            "ts": time.time(),
+                            "ts": self.trace_started_at or time.time(),
                             "error": None,
+                            "elapsed": time.time() - (self.trace_started_at or time.time()),
                         }
                     # allow quick re-run
                     self.trace_deadline = 0.0
@@ -733,6 +738,7 @@ class MeshTopApp:
                 with self.trace_lock:
                     self.trace_result = self.trace_result or {}
                     self.trace_result["error"] = f"PARSE ERROR: {_e}"
+                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
                 self.trace_deadline = 0.0
                 self.trace_cooldown_end = time.time() + 0.5
 
@@ -916,7 +922,7 @@ class MeshTopApp:
             if row_y >= h - 1:
                 break
             t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
-            dir_str = "→" if msg.direction == "OUT" else "←"
+            dir_str = ">" if msg.direction == "OUT" else "<"
             from_str = f"{msg.from_id[-4:]}({msg.from_short})"
             to_str = f"{msg.to_id[-4:]}({msg.to_short})"
             status = msg.status
@@ -966,13 +972,18 @@ class MeshTopApp:
 
         node = self.nodes[self.trace_target_num]
         target_name = node.short_name or node.long_name or node.node_id or f"#{node.num}"
-        stdscr.addnstr(top, 0, f"TRACE → {target_name}".ljust(maxw), maxw, curses.A_BOLD)
+        stdscr.addnstr(top, 0, f"TRACE -> {target_name}".ljust(maxw), maxw, curses.A_BOLD)
 
         started = tr.get("ts") or time.time()
-        elapsed = time.time() - started
+        elapsed_frozen = tr.get("elapsed")
+        if elapsed_frozen is not None:
+            elapsed = elapsed_frozen
+        else:
+            elapsed = time.time() - started
+
         route = tr.get("route", [])
         err = tr.get("error")
-        status = "OK" if route else ("Error" if err else "Waiting…")
+        status = "OK" if route else ("Error" if err else "Waiting...")
 
         stdscr.addnstr(top + 1, 0, f"Status: {status}    Elapsed: {elapsed:.1f}s".ljust(maxw), maxw)
 
@@ -990,15 +1001,15 @@ class MeshTopApp:
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
         elif route is not None and len(route) == 0:
-            remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
-            stdscr.addnstr(y, 0, f"Waiting for trace… (~{remain:.1f}s left)".ljust(maxw), maxw)
+            remain = max(0.0, self.trace_timeout_sec - elapsed)
+            stdscr.addnstr(y, 0, f"Waiting for trace... (~{remain:.1f}s left)".ljust(maxw), maxw)
             y += 1
             stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
             y += 1
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
         elif not route:
-            remain = max(0.0, self.trace_timeout_sec - (time.time() - started))
+            remain = max(0.0, self.trace_timeout_sec - elapsed)
             stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
             y += 2
             stdscr.addnstr(y, 0, "No traceroute result yet.".ljust(maxw), maxw)
@@ -1040,17 +1051,17 @@ class MeshTopApp:
 
                 if y >= h - 2:
                     break
-                stdscr.addnstr(y, 2, "   │", maxw)
+                stdscr.addnstr(y, 2, "   |", maxw)
                 y += 1
 
                 if y >= h - 2:
                     break
-                stdscr.addnstr(y, 2, f"   │   fwd: {fwd_txt}  │  back: {back_txt}", maxw)
+                stdscr.addnstr(y, 2, f"   |   fwd: {fwd_txt}  |  back: {back_txt}", maxw)
                 y += 1
 
                 if y >= h - 2:
                     break
-                stdscr.addnstr(y, 2, "   ▼", maxw)
+                stdscr.addnstr(y, 2, "   v", maxw)
                 y += 1
 
         stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
@@ -1213,7 +1224,7 @@ class MeshTopApp:
                     hops_names.append(f"{nn.short_name or nn.node_id or f'#{n}'}")
                 else:
                     hops_names.append(f"#{n}")
-            route_path = " → ".join(hops_names)
+            route_path = " -> ".join(hops_names)
 
             snr_fwd = getattr(selected_node, "last_route_snr_towards", []) or []
             snr_back = getattr(selected_node, "last_route_snr_back", []) or []
@@ -1324,7 +1335,7 @@ class MeshTopApp:
                 attrs |= curses.A_REVERSE
 
             t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
-            dir_str = "→" if msg.direction == "OUT" else "←"
+            dir_str = ">" if msg.direction == "OUT" else "<"
             from_str = f"{msg.from_id[-8:]}({msg.from_short})"
             to_str = f"{msg.to_id[-8:]}({msg.to_short})"
             status = msg.status
