@@ -1017,17 +1017,23 @@ class MeshTopApp:
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
 
-        # Build hop names
         def name_from_num(n):
             n = int(n)
             if n in self.nodes:
                 nn = self.nodes[n]
-                return f"{nn.short_name or nn.node_id or f'#{n}'}"
+                name = nn.long_name
+                if not name or name == "?":
+                    name = nn.short_name
+                if not name or name == "?":
+                    name = nn.node_id
+                if not name or name == "?":
+                    name = f"#{n}"
+                return name
             return f"#{n}"
 
         names = [name_from_num(n) for n in route]
         if self.local_num is not None and route and route[0] == self.local_num:
-            names[0] = self.local_short or "ME"
+            names[0] = self.local_long or self.local_short or "ME"
 
         # Draw vertical path
         stdscr.addnstr(y, 0, "Trace Path Discovery:".ljust(maxw), maxw, curses.A_BOLD)
