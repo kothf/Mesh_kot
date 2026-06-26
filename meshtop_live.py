@@ -425,9 +425,20 @@ class MeshTopApp:
 
     # ---------- Connection and initial load ----------
 
-    def connect(self):
-        # In meshtastic 2.7.x: TCPInterface(host, portNumber=port)
         self.iface = TCPInterface(self.host, portNumber=self.port)
+
+        # Suppress meshtastic library print output from traceroutes by stubbing/wrapping onResponseTraceRoute
+        if hasattr(self.iface, "onResponseTraceRoute"):
+            original_on_response = self.iface.onResponseTraceRoute
+            def silent_on_response(p):
+                import io, sys
+                old_stdout = sys.stdout
+                sys.stdout = io.StringIO()
+                try:
+                    original_on_response(p)
+                finally:
+                    sys.stdout = old_stdout
+            self.iface.onResponseTraceRoute = silent_on_response
 
         info = self.iface.myInfo
         if info:
