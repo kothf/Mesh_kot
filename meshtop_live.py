@@ -400,8 +400,8 @@ class MeshTopApp:
     # ---------- Connection and initial load ----------
 
     def connect(self):
-        # In meshtastic 2.7.x: TCPInterface(host, port)
-        self.iface = TCPInterface(self.host, self.port)
+        # In meshtastic 2.7.x: TCPInterface(host, portNumber=port)
+        self.iface = TCPInterface(self.host, portNumber=self.port)
 
         info = self.iface.myInfo
         if info:
