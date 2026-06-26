@@ -1429,7 +1429,10 @@ class MeshTopApp:
             self.messages.append(msg)
 
     def run_curses(self, stdscr):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         stdscr.nodelay(True)
         stdscr.timeout(200)
 
@@ -1548,20 +1551,100 @@ class MeshTopApp:
                 self._handle_msgs_keys(ch)
 
 
-    # ---------- Public run ----------
-
     def run(self):
         self.connect()
         curses.wrapper(self.run_curses)
 
 
+def get_local_subnet():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.254.254.254', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    
+    if ip == '127.0.0.1':
+        return None
+    
+    parts = ip.split('.')
+    if len(parts) == 4:
+        return '.'.join(parts[:3]) + '.'
+    return None
+
+
+def check_ip(ip, port=4403, timeout=0.8):
+    import socket
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        if result == 0:
+            return ip
+    except Exception:
+        pass
+    return None
+
+
+def scan_network():
+    from concurrent.futures import ThreadPoolExecutor
+    subnet = get_local_subnet()
+    if not subnet:
+        return []
+    
+    ips = [f"{subnet}{i}" for i in range(1, 255)]
+    found_ips = []
+    
+    print(f"Scanning local subnet {subnet}0/24 for Meshtastic devices on port 4403...")
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        results = executor.map(lambda ip: check_ip(ip), ips)
+        for r in results:
+            if r:
+                found_ips.append(r)
+                
+    return found_ips
+
+
 def main():
     parser = argparse.ArgumentParser(description="Meshtastic live curses viewer")
-    parser.add_argument("--host", required=True)
+    parser.add_argument("--host", required=False, help="Meshtastic device IP/hostname")
     parser.add_argument("--port", type=int, default=4403)
     args = parser.parse_args()
 
-    app = MeshTopApp(args.host, args.port)
+    host = args.host
+    if not host:
+        found_ips = scan_network()
+        
+        if len(found_ips) == 1:
+            host = found_ips[0]
+            print(f"Found Meshtastic device at {host}. Connecting...")
+            time.sleep(1)
+        elif len(found_ips) > 1:
+            print("\nMultiple Meshtastic devices found:")
+            for idx, ip in enumerate(found_ips, 1):
+                print(f"[{idx}] {ip}")
+            while True:
+                try:
+                    choice = input(f"Choose device (1-{len(found_ips)}): ").strip()
+                    choice_idx = int(choice) - 1
+                    if 0 <= choice_idx < len(found_ips):
+                        host = found_ips[choice_idx]
+                        break
+                except ValueError:
+                    pass
+                print("Invalid choice. Please enter a number in range.")
+        else:
+            print("\nNo Meshtastic devices detected automatically on port 4403.")
+            host = input("Please enter device IP address manually: ").strip()
+            if not host:
+                print("No IP entered. Exiting.")
+                return
+
+    app = MeshTopApp(host, args.port)
     app.run()
 
 
