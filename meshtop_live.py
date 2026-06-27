@@ -1202,14 +1202,17 @@ class MeshTopApp:
                 hop_str = f"{node.hop_start - node.hop_limit:>2}"
 
             route_str = "--"
-            if getattr(node, "last_route", None):
-                names = []
-                for n in node.last_route:
-                    if n in self.nodes:
-                        names.append(self.nodes[n].short_name or "?")
-                    else:
-                        names.append("?")
-                route_str = ">".join(names)
+            if getattr(node, "last_route", None) is not None:
+                if len(node.last_route) == 0:
+                    route_str = "DIRECT"
+                else:
+                    names = []
+                    for n in node.last_route:
+                        if n in self.nodes:
+                            names.append(self.nodes[n].short_name or "?")
+                        else:
+                            names.append("?")
+                    route_str = ">".join(names)
 
             bat_str = f"{node.battery:>3}%" if node.battery is not None else " --%"
             v_str = f"{node.voltage:.2f}" if node.voltage is not None else " -- "
@@ -1254,7 +1257,7 @@ class MeshTopApp:
 
         route_info_row = h - 4
         selected_node = nodes_list[self.selected_node_index] if nodes_list else None
-        if selected_node and getattr(selected_node, "last_route", None):
+        if selected_node and getattr(selected_node, "last_route", None) is not None:
             hops_names = []
             for n in selected_node.last_route:
                 if n in self.nodes:
@@ -1263,17 +1266,29 @@ class MeshTopApp:
                 else:
                     hops_names.append(f"#{n}")
             route_path = " -> ".join(hops_names)
+            if not route_path:
+                route_path = "DIRECT"
 
             snr_fwd = getattr(selected_node, "last_route_snr_towards", []) or []
             snr_back = getattr(selected_node, "last_route_snr_back", []) or []
             snr_str = ""
+
+            def format_snrs(vals):
+                formatted = []
+                for val in vals:
+                    if val is not None and val != -128:
+                        formatted.append(f"{val/4.0:+.1f}dB")
+                    else:
+                        formatted.append("?dB")
+                return ", ".join(formatted)
+
             if snr_fwd:
-                snr_str += f" (fwd: {', '.join(map(str, snr_fwd))}"
+                snr_str += f" (fwd: {format_snrs(snr_fwd)}"
             if snr_back:
                 if snr_str:
-                    snr_str += f" | back: {', '.join(map(str, snr_back))})"
+                    snr_str += f" | back: {format_snrs(snr_back)})"
                 else:
-                    snr_str += f" (back: {', '.join(map(str, snr_back))})"
+                    snr_str += f" (back: {format_snrs(snr_back)})"
             else:
                 if snr_str:
                     snr_str += ")"
