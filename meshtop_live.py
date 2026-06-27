@@ -1001,7 +1001,7 @@ class MeshTopApp:
 
         route = tr.get("route", [])
         err = tr.get("error")
-        status = "OK" if route else ("Error" if err else "Waiting...")
+        status = "OK" if (elapsed_frozen is not None and not err) else ("Error" if err else "Waiting...")
 
         stdscr.addnstr(top + 1, 0, f"Status: {status}    Elapsed: {elapsed:.1f}s".ljust(maxw), maxw)
 
@@ -1018,7 +1018,7 @@ class MeshTopApp:
             y += 2
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
-        elif route is not None and len(route) == 0:
+        elif elapsed_frozen is None:
             remain = max(0.0, self.trace_timeout_sec - elapsed)
             stdscr.addnstr(y, 0, f"Waiting for trace... (~{remain:.1f}s left)".ljust(maxw), maxw)
             y += 1
@@ -1026,31 +1026,43 @@ class MeshTopApp:
             y += 1
             stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
             return
-        elif not route:
-            remain = max(0.0, self.trace_timeout_sec - elapsed)
-            stdscr.addnstr(y, 0, f"Auto-return in ~{remain:.1f}s (press 't' to retry)".ljust(maxw), maxw)
-            y += 2
-            stdscr.addnstr(y, 0, "No traceroute result yet.".ljust(maxw), maxw)
-            y += 2
-            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
-            return
 
         def name_from_num(n):
             n = int(n)
-            if n in self.nodes:
-                nn = self.nodes[n]
-                name = nn.long_name
+            with self.data_lock:
+                has_node = n in self.nodes
+                if has_node:
+                    nn = self.nodes[n]
+                    long_name = nn.long_name
+                    short_name = nn.short_name
+                    node_id = nn.node_id
+            if has_node:
+                name = long_name
                 if not name or name == "?":
-                    name = nn.short_name
+                    name = short_name
                 if not name or name == "?":
-                    name = nn.node_id
+                    name = node_id
                 if not name or name == "?":
                     name = f"#{n}"
                 return name
             return f"#{n}"
 
-        names = [name_from_num(n) for n in route]
-        if self.local_num is not None and route and route[0] == self.local_num:
+        # Build the full route including us and the destination
+        local_num = self.local_num or tr.get("to_num")
+        dest_num = tr.get("dest_num")
+        intermediate_hops = route
+
+        full_route = []
+        if local_num is not None:
+            full_route.append(local_num)
+        for h_num in intermediate_hops:
+            if h_num not in full_route and h_num != dest_num:
+                full_route.append(h_num)
+        if dest_num is not None and dest_num not in full_route:
+            full_route.append(dest_num)
+
+        names = [name_from_num(n) for n in full_route]
+        if self.local_num is not None and full_route and full_route[0] == self.local_num:
             names[0] = self.local_long or self.local_short or "ME"
 
         # Draw vertical path
