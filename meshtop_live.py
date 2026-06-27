@@ -417,6 +417,7 @@ class MeshTopApp:
         self.input_target_num: Optional[int] = None
         self.trace_thread = None
         self.trace_lock = threading.Lock()
+        self.data_lock = threading.Lock()
 
         # ---- add these ----
         self.trace_deadline = 0.0
@@ -428,17 +429,11 @@ class MeshTopApp:
     def connect(self):
         self.iface = TCPInterface(self.host, portNumber=self.port)
 
-        # Suppress meshtastic library print output from traceroutes by stubbing/wrapping onResponseTraceRoute
+        # Suppress meshtastic library print output from traceroutes by stubbing onResponseTraceRoute
         if hasattr(self.iface, "onResponseTraceRoute"):
-            original_on_response = self.iface.onResponseTraceRoute
             def silent_on_response(p):
-                import io, sys
-                old_stdout = sys.stdout
-                sys.stdout = io.StringIO()
-                try:
-                    original_on_response(p)
-                finally:
-                    sys.stdout = old_stdout
+                if hasattr(self.iface, "_acknowledgment"):
+                    self.iface._acknowledgment.receivedTraceRoute = True
             self.iface.onResponseTraceRoute = silent_on_response
 
         info = self.iface.myInfo
@@ -555,11 +550,12 @@ class MeshTopApp:
     # ---------- Node helpers ----------
 
     def _get_or_create_node(self, num: int) -> NodeInfo:
-        node = self.nodes.get(num)
-        if not node:
-            node = NodeInfo(num=num)
-            self.nodes[num] = node
-        return node
+        with self.data_lock:
+            node = self.nodes.get(num)
+            if not node:
+                node = NodeInfo(num=num)
+                self.nodes[num] = node
+            return node
 
     def _update_distance(self, node: NodeInfo):
         if self.local_lat is None or self.local_lon is None:
@@ -571,7 +567,9 @@ class MeshTopApp:
     def _update_all_distances(self):
         if self.local_lat is None or self.local_lon is None:
             return
-        for node in self.nodes.values():
+        with self.data_lock:
+            nodes = list(self.nodes.values())
+        for node in nodes:
             self._update_distance(node)
 
     # ---------- meshtastic callbacks ----------
@@ -792,20 +790,21 @@ class MeshTopApp:
             direction = "OUT"
         status = "RECEIVED" if direction == "IN" else "SENT"
 
-        self.messages.append(
-            MessageInfo(
-                timestamp=time.time(),
-                direction=direction,
-                from_id=from_id,
-                from_short=from_short,
-                to_id=to_id,
-                to_short=to_short,
-                text=text,
-                portnum=d.get("portnum", ""),
-                status=status,
-                pkt_id=packet.get("id"),
+        with self.data_lock:
+            self.messages.append(
+                MessageInfo(
+                    timestamp=time.time(),
+                    direction=direction,
+                    from_id=from_id,
+                    from_short=from_short,
+                    to_id=to_id,
+                    to_short=to_short,
+                    text=text,
+                    portnum=d.get("portnum", ""),
+                    status=status,
+                    pkt_id=packet.get("id"),
+                )
             )
-        )
 
         # best-effort archive
         try:
@@ -855,45 +854,32 @@ class MeshTopApp:
             print(f"[archiver] outbound pre-log failed: {_e}", file=sys.stderr)
         if not self.iface:
             return
-        node = self.nodes.get(target_num)
+        with self.data_lock:
+            node = self.nodes.get(target_num)
         if not node:
             return
 
         if not node.node_id:
             # can't send without node_id
-            self.messages.append(
-                MessageInfo(
-                    timestamp=time.time(),
-                    direction="OUT",
-                    from_id=self.local_id or "^local",
-                    from_short=self.local_short,
-                    to_id=f"#{target_num}",
-                    to_short=node.short_name or "?",
-                    text="[ERROR: node has no node_id]",
-                    status="UNKNOWN",
+            with self.data_lock:
+                self.messages.append(
+                    MessageInfo(
+                        timestamp=time.time(),
+                        direction="OUT",
+                        from_id=self.local_id or "^local",
+                        from_short=self.local_short,
+                        to_id=f"#{target_num}",
+                        to_short=node.short_name or "?",
+                        text="[ERROR: node has no node_id]",
+                        status="UNKNOWN",
+                    )
                 )
-            )
             return
 
         clean_text = safe_text(text)
 
         # append to log immediately
-        self.messages.append(
-            MessageInfo(
-                timestamp=time.time(),
-                direction="OUT",
-                from_id=self.local_id or "^local",
-                from_short=self.local_short,
-                to_id=node.node_id,
-                to_short=node.short_name,
-                text=clean_text,
-                status="SENT",
-            )
-        )
-
-        try:
-            self.iface.sendText(clean_text, destinationId=node.node_id, wantAck=True)
-        except Exception as e:
+        with self.data_lock:
             self.messages.append(
                 MessageInfo(
                     timestamp=time.time(),
@@ -902,10 +888,27 @@ class MeshTopApp:
                     from_short=self.local_short,
                     to_id=node.node_id,
                     to_short=node.short_name,
-                    text=f"[SEND ERROR: {e}]",
-                    status="UNKNOWN",
+                    text=clean_text,
+                    status="SENT",
                 )
             )
+
+        try:
+            self.iface.sendText(clean_text, destinationId=node.node_id, wantAck=True)
+        except Exception as e:
+            with self.data_lock:
+                self.messages.append(
+                    MessageInfo(
+                        timestamp=time.time(),
+                        direction="OUT",
+                        from_id=self.local_id or "^local",
+                        from_short=self.local_short,
+                        to_id=node.node_id,
+                        to_short=node.short_name,
+                        text=f"[SEND ERROR: {e}]",
+                        status="UNKNOWN",
+                    )
+                )
 
     # ---------- Drawing helpers ----------
 
@@ -924,11 +927,14 @@ class MeshTopApp:
         if start_row >= h - 1 or maxw <= 0:
             return
 
-        if not self.messages:
+        with self.data_lock:
+            msgs_copy = list(self.messages[-max_rows:])
+
+        if not msgs_copy:
             stdscr.addnstr(start_row, 0, "(no messages yet)".ljust(maxw), maxw)
             return
 
-        msgs = list(reversed(self.messages[-max_rows:]))
+        msgs = list(reversed(msgs_copy))
         for i, msg in enumerate(msgs):
             row_y = start_row + i
             if row_y >= h - 1:
@@ -1094,7 +1100,8 @@ class MeshTopApp:
         top = 1
         rows_avail = h - 7  # leave space for log + footer + route info
 
-        nodes_list = list(self.nodes.values())
+        with self.data_lock:
+            nodes_list = list(self.nodes.values())
         nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
 
         # 1. Safety check: ensure selection is within bounds
@@ -1283,7 +1290,11 @@ class MeshTopApp:
 
         rows_avail = h - 3  # rows available for messages (excluding header+footer)
 
-        if not self.messages:
+        with self.data_lock:
+            msgs_copy = list(self.messages[-1000:])
+            global_total = len(self.messages)
+
+        if not msgs_copy:
             stdscr.addnstr(
                 top,
                 0,
@@ -1295,12 +1306,11 @@ class MeshTopApp:
             return
 
         # Work with the full list (or cap to last 1000 for sanity)
-        msgs = list(reversed(self.messages[-1000:]))
+        msgs = list(reversed(msgs_copy))
         total = len(msgs)
 
         # selected_msg_index is relative to full self.messages; remap if needed
         # If messages was truncated to last 1000, we also adjust selection
-        global_total = len(self.messages)
         if global_total > 1000:
             # The oldest of 'msgs' corresponds to index (global_total - 1000)
             base_index = global_total - 1000
@@ -1408,7 +1418,8 @@ class MeshTopApp:
             self.input_text += chr(ch)
 
     def _handle_nodes_keys(self, ch):
-        nodes_list = list(self.nodes.values())
+        with self.data_lock:
+            nodes_list = list(self.nodes.values())
         nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
 
         if ch == curses.KEY_UP:
