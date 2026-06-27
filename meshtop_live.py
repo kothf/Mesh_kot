@@ -667,7 +667,8 @@ class MeshTopApp:
         pn = d.get("portnum", "")
         try:
             if isinstance(pn, int):
-                pn_name = mesh_pb2.PortNum.Name(pn)
+                from meshtastic.protobuf import portnums_pb2
+                pn_name = portnums_pb2.PortNum.Name(pn)
             elif isinstance(pn, str):
                 pn_name = pn
             else:
@@ -692,7 +693,7 @@ class MeshTopApp:
         # Traceroute / RouteDiscovery can arrive under several names or even as a raw int
         looks_like_trace = pn_name in {
             "TRACEROUTE_APP", "ROUTE_DISCOVERY_APP", "TRACE_ROUTE_APP", "ROUTE_TRACE_APP"
-        } or (isinstance(pn, int) and pn in (9, 48, 49))  # 9 is TRACEROUTE_APP in current enums
+        } or (isinstance(pn, int) and pn in (9, 48, 49, 70))  # 9/70 is TRACEROUTE_APP in current enums
 
         if looks_like_trace:
             try:
