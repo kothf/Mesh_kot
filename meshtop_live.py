@@ -415,6 +415,7 @@ class MeshTopApp:
         self.view_mode = "NODES"  # or "MSGS"
         self.selected_node_index = 0
         self.selected_msg_index = 0
+        self.selected_chat_index = 0
 
         # scrolling offsets
         self.node_view_offset = 0
@@ -1331,115 +1332,120 @@ class MeshTopApp:
         footer = "[↑↓] select node  [Enter] send  [t] trace  [m] msgs  [s] stats  [p] export  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
-    # ---------- MESSAGES view ----------
+    def _get_chat_partners(self):
+        with self.data_lock:
+            all_nodes = [node for node in self.nodes.values() if not node.is_me and node.num != self.local_num]
+            messages = list(self.messages)
+            
+        # Find the last message timestamp for each node num
+        last_msg_ts = {}
+        for msg in messages:
+            for n in all_nodes:
+                if _msg_involves_node(msg, n, self.local_id, self.local_num):
+                    last_msg_ts[n.num] = max(last_msg_ts.get(n.num, 0), msg.timestamp)
+                    
+        def sort_key(n):
+            ts = last_msg_ts.get(n.num, 0)
+            if ts > 0:
+                return (0, -ts)  # active chats first
+            seen = getattr(n, "last_seen", 0) or 0
+            if seen > 0:
+                return (1, -seen)  # seen nodes next
+            return (2, n.short_name or n.node_id or str(n.num))
+            
+        return sorted(all_nodes, key=sort_key)
 
     def _draw_messages_view(self, stdscr):
         h, w = stdscr.getmaxyx()
         maxw = w - 1
         top = 1
         self._wipe_body(stdscr)
-
-        rows_avail = h - 3  # rows available for messages (excluding header+footer)
-
-        with self.data_lock:
-            msgs_copy = list(self.messages[-1000:])
-            global_total = len(self.messages)
-
-        if not msgs_copy:
+        
+        chat_partners = self._get_chat_partners()
+        
+        if not chat_partners:
             stdscr.addnstr(
                 top,
                 0,
-                "(no messages yet – send from NODES view)".ljust(maxw),
+                "(no seen nodes or chat partners available yet)".ljust(maxw),
                 maxw,
             )
             footer = "[n] nodes view  [s] stats view  [q] quit"
             stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
             return
-
-        # Work with the full list (or cap to last 1000 for sanity)
-        msgs = list(reversed(msgs_copy))
-        total = len(msgs)
-
-        # selected_msg_index is relative to full self.messages; remap if needed
-        # If messages was truncated to last 1000, we also adjust selection
-        if global_total > 1000:
-            # The oldest of 'msgs' corresponds to index (global_total - 1000)
-            base_index = global_total - 1000
-            # Clamp selected index into [base_index, global_total-1]
-            if self.selected_msg_index < base_index:
-                self.selected_msg_index = base_index
-            if self.selected_msg_index >= global_total:
-                self.selected_msg_index = global_total - 1
-            # local index inside msgs
-            selected_local = self.selected_msg_index - base_index
-        else:
-            # 1-1 mapping
-            if self.selected_msg_index >= global_total:
-                self.selected_msg_index = max(0, global_total - 1)
-            selected_local = self.selected_msg_index
-
-        # Now 'selected_local' is index into msgs[]
-        # SCROLLING: adjust msg_view_offset so selected is visible
-        if selected_local < self.msg_view_offset:
-            self.msg_view_offset = selected_local
-        elif selected_local >= self.msg_view_offset + rows_avail:
-            self.msg_view_offset = selected_local - rows_avail + 1
-
-        # Clamp msg_view_offset
-        if total <= rows_avail:
-            self.msg_view_offset = 0
-        else:
-            max_offset = total - rows_avail
-            if self.msg_view_offset > max_offset:
-                self.msg_view_offset = max_offset
-
-        visible = msgs[self.msg_view_offset:self.msg_view_offset + rows_avail]
-
-        for i, msg in enumerate(visible):
-            row_y = top + i
+            
+        # Clamp selection index
+        self.selected_chat_index = max(0, min(self.selected_chat_index, len(chat_partners) - 1))
+        active_partner = chat_partners[self.selected_chat_index]
+        
+        # Split layout columns
+        left_w = 22
+        right_x = 24
+        
+        # --- Draw Left Column: Conversations List ---
+        left_avail_rows = h - 3
+        for idx, partner in enumerate(chat_partners):
+            row_y = top + idx
             if row_y >= h - 1:
                 break
-
-            # figure out whether this row is the selected row
-            if global_total > 1000:
-                base_index = global_total - 1000
-                msg_global_index = base_index + self.msg_view_offset + i
-            else:
-                msg_global_index = self.msg_view_offset + i
-
-            selected = (msg_global_index == self.selected_msg_index)
-
+                
+            name = partner.short_name or partner.node_id or f"#{partner.num}"
+            if len(name) > left_w:
+                name = name[:left_w-3] + "..."
+                
             attrs = curses.A_NORMAL
-            if selected:
+            if idx == self.selected_chat_index:
                 attrs |= curses.A_REVERSE
-
-            t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
-            dir_str = ">" if msg.direction == "OUT" else "<"
-            from_str = f"{msg.from_id[-8:]}({msg.from_short})"
-            to_str = f"{msg.to_id[-8:]}({msg.to_short})"
-            status = msg.status
-
-            line_prefix = f"{t_str} {dir_str} {from_str}->{to_str} [{status}] "
-            text_space = max(10, maxw - len(line_prefix) - 1)
-            text = safe_text(msg.text)[:text_space]
-            line = (line_prefix + text).ljust(maxw)
-
-            # highlight "to me" using the SAME attrs pattern you use in NODES
-            # highlight ONLY messages explicitly sent TO *my* node
-            to_me = False
-            if (msg.direction or "").upper() == "IN":  # must be inbound
-                norm_to = _norm(msg.to_id)
-                if (self.local_id and norm_to == _norm(self.local_id)) \
-                        or (self.local_num is not None and norm_to == str(self.local_num)) \
-                        or ((msg.to_short or "") and (self.local_short or "") and msg.to_short == self.local_short):
-                    to_me = True
-
-            if curses.has_colors() and to_me:
-                attrs |= curses.color_pair(3) | curses.A_BOLD
-
-            stdscr.addnstr(row_y, 0, line, maxw, attrs)
-
-        footer = "[↑↓] scroll / select  [n] nodes view  [s] stats view  [q] quit"
+                
+            line = name.ljust(left_w)
+            stdscr.addnstr(row_y, 0, line, left_w, attrs)
+            
+        # Draw vertical separator line
+        for y in range(top, h - 1):
+            stdscr.addch(y, left_w + 1, curses.ACS_VLINE)
+            
+        # --- Draw Right Column: Active Conversation Messages ---
+        with self.data_lock:
+            chat_msgs = [
+                msg for msg in self.messages
+                if _msg_involves_node(msg, active_partner, self.local_id, self.local_num)
+            ]
+            
+        right_w = w - right_x - 1
+        msg_rows_avail = h - 3
+        
+        if not chat_msgs:
+            stdscr.addnstr(
+                top,
+                right_x,
+                "(no messages in this conversation yet)".ljust(right_w),
+                right_w,
+            )
+        else:
+            visible_msgs = chat_msgs[-msg_rows_avail:]
+            for idx, msg in enumerate(visible_msgs):
+                row_y = top + idx
+                if row_y >= h - 1:
+                    break
+                    
+                t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
+                
+                # Determine sender name & colors
+                if msg.direction == "OUT":
+                    sender = "Me"
+                    attrs = curses.color_pair(3)  # Yellow
+                else:
+                    sender = active_partner.short_name or active_partner.node_id or f"#{active_partner.num}"
+                    attrs = curses.color_pair(5)  # Cyan
+                    
+                prefix = f"[{t_str}] {sender}: "
+                text_space = max(5, right_w - len(prefix))
+                txt = safe_text(msg.text)[:text_space]
+                
+                line = (prefix + txt).ljust(right_w)
+                stdscr.addnstr(row_y, right_x, line, right_w, attrs)
+                
+        # Footer
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- Input handling ----------
@@ -1500,14 +1506,19 @@ class MeshTopApp:
 
 
     def _handle_msgs_keys(self, ch):
-        total = len(self.messages)
-        if total == 0:
+        chat_partners = self._get_chat_partners()
+        if not chat_partners:
             return
 
         if ch == curses.KEY_UP:
-            self.selected_msg_index = max(0, self.selected_msg_index - 1)
+            self.selected_chat_index = max(0, self.selected_chat_index - 1)
+            self._need_full_clear = True
         elif ch == curses.KEY_DOWN:
-            self.selected_msg_index = min(total - 1, self.selected_msg_index + 1)
+            self.selected_chat_index = min(len(chat_partners) - 1, self.selected_chat_index + 1)
+            self._need_full_clear = True
+        elif ch in (10, 13, curses.KEY_ENTER):
+            partner = chat_partners[self.selected_chat_index]
+            self._start_input(partner.num)
 
     # ---------- curses main loop ----------
 
@@ -1600,6 +1611,7 @@ class MeshTopApp:
                 curses.init_pair(2, curses.COLOR_GREEN, -1)  # router nodes
                 curses.init_pair(3, curses.COLOR_YELLOW, -1)  # my node
                 curses.init_pair(4, curses.COLOR_BLUE, -1)  # messages to me (pair 4)
+                curses.init_pair(5, curses.COLOR_CYAN, -1)  # received messages (pair 5)
             except curses.error:
                 pass
 
