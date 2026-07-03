@@ -325,6 +325,14 @@ class MeshTopApp:
 
         now = time.time()
 
+        # Prevent manual trace if background auto-trace is actively running
+        if getattr(self, "auto_trace_in_progress", False) and getattr(self, "auto_trace_active_node", None) is not None:
+            with self.trace_lock:
+                self.trace_result = self.trace_result or {}
+                self.trace_result["error"] = "TRACE suppressed (auto-trace active)"
+                self.trace_result["elapsed"] = 0.0
+            return
+
         # Respect cooldown or an active in-flight attempt
         if now < self.trace_cooldown_end or self._trace_active():
             with self.trace_lock:
