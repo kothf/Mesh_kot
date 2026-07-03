@@ -926,7 +926,7 @@ class MeshTopApp:
         if h <= 0 or w <= 1:
             return
         maxw = w - 1
-        if getattr(self, "auto_trace_active_node", None):
+        if getattr(self, "auto_trace_in_progress", False) and getattr(self, "auto_trace_active_node", None):
             text += f" | [Auto-tracing: {self.auto_trace_active_node}]"
         stdscr.attron(curses.A_REVERSE)
         stdscr.addnstr(0, 0, safe_text(text).ljust(maxw), maxw)
@@ -1701,6 +1701,9 @@ class MeshTopApp:
             
             if node_nums:
                 self.auto_trace_in_progress = True
+                no_answer_nodes = []
+                
+                # --- PASS 1: Trace all seen nodes ---
                 for num in node_nums:
                     if not self.running:
                         break
@@ -1715,6 +1718,10 @@ class MeshTopApp:
                     # Set active node indicator for the header
                     self.auto_trace_active_node = node_name
                     
+                    # Clear acknowledgment flag before trace
+                    if self.iface and hasattr(self.iface, "_acknowledgment"):
+                        self.iface._acknowledgment.receivedTraceRoute = False
+                    
                     try:
                         if self.iface:
                             if hasattr(self.iface, "sendTraceRoute"):
@@ -1724,9 +1731,46 @@ class MeshTopApp:
                     except Exception:
                         pass
                     
-                    # Clear active indicator and pause slightly between nodes to avoid congestion
+                    # Check if answered
+                    answered = False
+                    if self.iface and hasattr(self.iface, "_acknowledgment"):
+                        answered = self.iface._acknowledgment.receivedTraceRoute
+                    
+                    if not answered:
+                        no_answer_nodes.append((num, dest, node_name))
+                    
+                    # Clear active indicator and pause slightly between nodes
                     self.auto_trace_active_node = None
                     time.sleep(5)
+                
+                # --- PASS 2: Return to no-answer nodes ---
+                if no_answer_nodes and self.running:
+                    for num, dest, node_name in no_answer_nodes:
+                        if not self.running:
+                            break
+                        
+                        # Verify the node is still valid
+                        with self.data_lock:
+                            node = self.nodes.get(num)
+                            if not node or getattr(node, "last_seen", 0) == 0:
+                                continue
+                        
+                        self.auto_trace_active_node = f"{node_name} (retry)"
+                        
+                        if self.iface and hasattr(self.iface, "_acknowledgment"):
+                            self.iface._acknowledgment.receivedTraceRoute = False
+                        
+                        try:
+                            if self.iface:
+                                if hasattr(self.iface, "sendTraceRoute"):
+                                    self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
+                                elif hasattr(self.iface, "traceroute"):
+                                    self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
+                        except Exception:
+                            pass
+                        
+                        self.auto_trace_active_node = None
+                        time.sleep(5)
                 
                 self.auto_trace_in_progress = False
             
