@@ -1979,38 +1979,48 @@ class MeshTopApp:
                 break
             time.sleep(1)
         
+        # Dictionary to track the timestamp of the last trace attempt for each node number
+        last_attempt_times = {}
+        
         while self.running:
+            now = time.time()
+            eligible_nodes = []
             with self.data_lock:
-                node_nums = [n for n, node in self.nodes.items() if n != self.local_num and getattr(node, "last_seen", 0) > 0]
+                for num, node in self.nodes.items():
+                    if num == self.local_num or node.is_me:
+                        continue
+                    seen_t = getattr(node, "last_seen", 0) or 0
+                    if seen_t > 0:
+                        last_att = last_attempt_times.get(num, 0)
+                        if now - last_att >= 86400:
+                            last_route_t = getattr(node, "last_route_time", 0) or 0
+                            if now - last_route_t >= 86400:
+                                eligible_nodes.append((num, node.node_id or node.num, node.short_name or node.long_name or f"#{node.num}"))
             
-            if node_nums:
+            if eligible_nodes:
                 try:
                     self.auto_trace_in_progress = True
                     no_answer_nodes = []
                     
-                    # --- PASS 1: Trace all seen nodes ---
-                    for num in node_nums:
+                    # --- PASS 1: Trace all eligible seen nodes ---
+                    for num, dest, node_name in eligible_nodes:
                         if not self.running:
                             break
                         
                         with self.data_lock:
                             node = self.nodes.get(num)
-                            if not node or node.is_me or getattr(node, "last_seen", 0) == 0:
+                            if not node or getattr(node, "last_seen", 0) == 0:
                                 continue
-                            dest = node.node_id or node.num
-                            node_name = node.short_name or node.long_name or f"#{node.num}"
                         
-                        # Wait if a manual user traceroute is active
                         while self._trace_active() and self.running:
                             time.sleep(1)
-
-                        # Set active node indicator for the header
+                            
                         self.auto_trace_active_node = node_name
+                        last_attempt_times[num] = time.time()
                         
-                        # Clear acknowledgment flag before trace
                         if self.iface and hasattr(self.iface, "_acknowledgment"):
                             self.iface._acknowledgment.receivedTraceRoute = False
-                        
+                            
                         try:
                             if self.iface:
                                 from meshtastic.protobuf import mesh_pb2, portnums_pb2
@@ -2024,8 +2034,7 @@ class MeshTopApp:
                                     channelIndex=0,
                                     hopLimit=7
                                 )
-                                # Custom short timeout wait loop (e.g. max 12 seconds)
-                                for _ in range(120):  # 120 * 0.1s = 12s
+                                for _ in range(120):
                                     if not self.running:
                                         break
                                     if self._trace_active():
@@ -2035,40 +2044,41 @@ class MeshTopApp:
                                     time.sleep(0.1)
                         except Exception:
                             pass
-                        
-                        # Check if answered
+                            
                         answered = False
                         if self.iface and hasattr(self.iface, "_acknowledgment"):
                             answered = self.iface._acknowledgment.receivedTraceRoute
-                        
+                            
                         if not answered:
                             no_answer_nodes.append((num, dest, node_name))
-                        
-                        # Clear active indicator and pause 30 seconds between nodes
+                            
                         self.auto_trace_active_node = None
-                        time.sleep(30)
-                    
+                        # Keep 30 sec pause between scans
+                        for _ in range(30):
+                            if not self.running:
+                                break
+                            time.sleep(1)
+                            
                     # --- PASS 2: Return to no-answer nodes ---
                     if no_answer_nodes and self.running:
                         for num, dest, node_name in no_answer_nodes:
                             if not self.running:
                                 break
-                            
-                            # Verify the node is still valid
+                                
                             with self.data_lock:
                                 node = self.nodes.get(num)
                                 if not node or getattr(node, "last_seen", 0) == 0:
                                     continue
-                            
-                            # Wait if a manual user traceroute is active
+                                    
                             while self._trace_active() and self.running:
                                 time.sleep(1)
-
+                                
                             self.auto_trace_active_node = f"{node_name} (retry)"
+                            last_attempt_times[num] = time.time()
                             
                             if self.iface and hasattr(self.iface, "_acknowledgment"):
                                 self.iface._acknowledgment.receivedTraceRoute = False
-                            
+                                
                             try:
                                 if self.iface:
                                     from meshtastic.protobuf import mesh_pb2, portnums_pb2
@@ -2082,8 +2092,7 @@ class MeshTopApp:
                                         channelIndex=0,
                                         hopLimit=7
                                     )
-                                    # Custom short timeout wait loop (e.g. max 12 seconds)
-                                    for _ in range(120):  # 120 * 0.1s = 12s
+                                    for _ in range(120):
                                         if not self.running:
                                             break
                                         if self._trace_active():
@@ -2093,15 +2102,18 @@ class MeshTopApp:
                                         time.sleep(0.1)
                             except Exception:
                                 pass
-                            
+                                
                             self.auto_trace_active_node = None
-                            time.sleep(30)
+                            for _ in range(30):
+                                if not self.running:
+                                    break
+                                time.sleep(1)
                 finally:
                     self.auto_trace_active_node = None
                     self.auto_trace_in_progress = False
             
-            # Wait 24 hours before the next cycle (check self.running in 1s steps)
-            for _ in range(86400):
+            # Short sleep before checking for new eligible nodes
+            for _ in range(5):
                 if not self.running:
                     break
                 time.sleep(1)
