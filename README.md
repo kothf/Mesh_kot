@@ -17,10 +17,15 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
   * 🟩 **Green Rows**: Automatically highlights transit router nodes (nodes serving as relays connecting your local node to $\ge 2$ target nodes).
   * 🟥 **Red Highlights**: Marks nodes with low battery levels (**20% or lower**) to warn of power degradation.
   * 🟨 **Yellow Rows**: Highlights your local node.
+* **💬 Conversational Messages Screen (`M` Key)**: A split messenger-style dashboard:
+  * **Left Column**: Lists active conversations (only shows nodes with which you have exchanged messages).
+  * **Right Column**: Displays the message log of the selected conversation.
+  * **Color Coding**: Sent messages are highlighted in **Yellow** (Me), and received messages are highlighted in **Cyan** (node name).
 * **📈 Stats View (`S` Key)**: A dedicated live dashboard showing:
   * **Node Activity**: Total node count, active (seen in last 30 min), inactive (> 30 min), and unseen/dead.
   * **Routing Statistics**: Total traced stations and calculated **Average Hop Count** of the active topology.
-  * **Link Quality (SNR)**: Shows the top 3 best direct links (green edge weights) and top 3 worst direct links (red edge weights) based on signal-to-noise ratio.
+  * **Link Quality (SNR)**: Shows the top 3 best direct links (green edge weights) and top 3 worst direct links (red edge weights).
+  * **🌳 Network Connections Map**: A dynamic, recursive text tree graph showing how packets route through intermediate relays. It automatically ranks busier routers first and scales/omits leaf nodes to fit your screen height.
 * **🗺️ Network Topology Export (`P` Key)**: Generates a complete Mermaid diagram map showing all nodes, connections, hops, and SNR weights, exporting it locally to `topology.md`.
 * **📜 Route History Logging**: Appends all successful traceroute paths (including timestamp, destination ID, short name, hops, forward, and return SNR values) to a local `traces.jsonl` database for long-term telemetry analysis.
 
@@ -60,10 +65,10 @@ pip install meshtastic
 
 Inside the dashboard:
 * **`n` / `N`**: Switch to **Nodes List** view.
-* **`m` / `M`**: Switch to **Messages List** view.
+* **`m` / `M`**: Switch to **Messages / Conversations** view.
 * **`s` / `S`**: Switch to the **Stats Dashboard** view.
 * **`t` / `T`**: Switch to **Signal Trace** view (or retry/run a manual trace on the selected node).
-* **`p` / `P`**: Export the live network topology map to `topology.md` (usable from Nodes view).
+* **`p` / `P`**: Export the live network topology map to `topology.md` (usable from Nodes or Stats view).
 * **`g` / `G`**: Toggle message filtering (ON/OFF) to hide system messages/gibberish.
 * **`q` / `Q`**: Quit the application safely.
 
