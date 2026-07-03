@@ -742,6 +742,8 @@ class MeshTopApp:
                         node.last_route_snr_back = snr_back
                         node.last_route_time = time.time()
 
+                    self._log_trace_history(far_end, route, snr_towards, snr_back)
+
                     is_auto = getattr(self, "auto_trace_in_progress", False)
                     should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num == far_end)
                     if should_update_ui:
@@ -1035,7 +1037,7 @@ class MeshTopApp:
             y += 1
             stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
             y += 2
-            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
+            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [s] stats  [q] quit".ljust(maxw), maxw)
             return
         elif elapsed_frozen is None:
             remain = max(0.0, self.trace_timeout_sec - elapsed)
@@ -1043,7 +1045,7 @@ class MeshTopApp:
             y += 1
             stdscr.addnstr(y, 0, "Press 't' to retry, or 'n' to return to nodes.".ljust(maxw), maxw)
             y += 1
-            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
+            stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [s] stats  [q] quit".ljust(maxw), maxw)
             return
 
         def name_from_num(n):
@@ -1119,7 +1121,7 @@ class MeshTopApp:
                 stdscr.addnstr(y, 2, "   v", maxw)
                 y += 1
 
-        stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [q] quit".ljust(maxw), maxw)
+        stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [s] stats  [q] quit".ljust(maxw), maxw)
 
     def _draw_nodes_view(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1325,7 +1327,7 @@ class MeshTopApp:
 
         self._draw_message_log(stdscr, start_row=h - 3, max_rows=2)
 
-        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] messages  [q] quit"
+        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] messages  [s] stats  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- MESSAGES view ----------
@@ -1349,7 +1351,7 @@ class MeshTopApp:
                 "(no messages yet – send from NODES view)".ljust(maxw),
                 maxw,
             )
-            footer = "[n] nodes view  [q] quit"
+            footer = "[n] nodes view  [s] stats view  [q] quit"
             stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
             return
 
@@ -1436,7 +1438,7 @@ class MeshTopApp:
 
             stdscr.addnstr(row_y, 0, line, maxw, attrs)
 
-        footer = "[↑↓] scroll / select  [n] nodes view  [q] quit"
+        footer = "[↑↓] scroll / select  [n] nodes view  [s] stats view  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- Input handling ----------
@@ -1638,15 +1640,15 @@ class MeshTopApp:
 
             if self.input_mode:
                 if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, q quit)")
+                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, q quit)")
                     self._draw_nodes_view(stdscr)
                 elif self.view_mode == "TRACE":
-                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, q quit)")
+                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
                     self._draw_trace_view(stdscr)
                 else:
                     # where you draw the MESSAGES header:
                     self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+                                      f"meshtop – MESSAGES (n nodes, s stats, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
 
                     self._draw_messages_view(stdscr)
 
@@ -1658,15 +1660,18 @@ class MeshTopApp:
                 stdscr.move(h - 2, min(maxw - 1, len(prompt) + len(txt)))
             else:
                 if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, q quit)")
+                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, q quit)")
                     self._draw_nodes_view(stdscr)
                 elif self.view_mode == "TRACE":
-                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, q quit)")
+                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
                     self._draw_trace_view(stdscr)
+                elif self.view_mode == "STATS":
+                    self._draw_header(stdscr, "meshtop – STATS (n nodes, m messages, q quit)")
+                    self._draw_stats_view(stdscr)
                 else:
                     # where you draw the MESSAGES header:
                     self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+                                      f"meshtop – MESSAGES (n nodes, s stats, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
 
                     self._draw_messages_view(stdscr)
 
@@ -1695,6 +1700,10 @@ class MeshTopApp:
                 self.view_mode = "NODES"
                 self._need_full_clear = True
                 continue
+            if ch in (ord("s"), ord("S")):
+                self.view_mode = "STATS"
+                self._need_full_clear = True
+                continue
 
             if self.view_mode == "NODES":
                 self._handle_nodes_keys(ch)
@@ -1702,6 +1711,137 @@ class MeshTopApp:
                 self._handle_trace_keys(ch)
             else:
                 self._handle_msgs_keys(ch)
+    def _log_trace_history(self, dest_num, route, snr_towards, snr_back):
+        dest_short = ""
+        with self.data_lock:
+            n = self.nodes.get(dest_num)
+            if n:
+                dest_short = n.short_name or ""
+                
+        record = {
+            "timestamp": time.time(),
+            "dest_num": dest_num,
+            "dest_short": dest_short,
+            "route": route,
+            "snr_towards": snr_towards,
+            "snr_back": snr_back
+        }
+        
+        try:
+            filepath = "/home/pinkfloyd/Mesh_kot/traces.jsonl"
+            import json
+            with open(filepath, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception:
+            pass
+
+    def _draw_stats_view(self, stdscr):
+        h, w = stdscr.getmaxyx()
+        if h < 8 or w < 40:
+            return
+        self._wipe_body(stdscr)
+        maxw = w - 1
+        
+        # Calculate stats
+        with self.data_lock:
+            nodes_list = list(self.nodes.values())
+        
+        total_nodes = len(nodes_list)
+        active_nodes = 0
+        inactive_nodes = 0
+        unseen_nodes = 0
+        now = time.time()
+        
+        hop_counts = []
+        direct_links = []
+        
+        for n in nodes_list:
+            if n.is_me:
+                continue
+            if n.last_seen and n.last_seen > 0:
+                if now - n.last_seen < 1800:
+                    active_nodes += 1
+                else:
+                    inactive_nodes += 1
+            else:
+                unseen_nodes += 1
+                
+            if getattr(n, "last_route", None) is not None:
+                hop_counts.append(len(n.last_route))
+                
+            if n.last_snr is not None:
+                direct_links.append((n.short_name or n.node_id or f"#{n.num}", n.last_snr))
+                
+        avg_hops = sum(hop_counts) / len(hop_counts) if hop_counts else 0.0
+        
+        direct_links.sort(key=lambda x: x[1], reverse=True)
+        best_links = direct_links[:3]
+        worst_links = sorted(direct_links, key=lambda x: x[1])[:3]
+        
+        row = 2
+        
+        # --- Node Activity Panel ---
+        stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+        stdscr.addnstr(row, 2, "■ NODE ACTIVITY STATISTICS", maxw - 4)
+        stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+        row += 1
+        stdscr.addnstr(row, 4, f"Active (last 30m): {active_nodes}", maxw - 6)
+        row += 1
+        stdscr.addnstr(row, 4, f"Inactive (> 30m):  {inactive_nodes}", maxw - 6)
+        row += 1
+        stdscr.addnstr(row, 4, f"Unseen / Dead:     {unseen_nodes}", maxw - 6)
+        row += 1
+        stdscr.addnstr(row, 4, f"Total Nodes:       {total_nodes}", maxw - 6)
+        
+        row += 2
+        
+        # --- Routing Panel ---
+        stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+        stdscr.addnstr(row, 2, "■ ROUTING STATISTICS", maxw - 4)
+        stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+        row += 1
+        stdscr.addnstr(row, 4, f"Traced Stations:   {len(hop_counts)}", maxw - 6)
+        row += 1
+        stdscr.addnstr(row, 4, f"Average Hop Count: {avg_hops:.2f} hops", maxw - 6)
+        
+        row += 2
+        
+        # --- Link Quality Panel ---
+        stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+        stdscr.addnstr(row, 2, "■ DIRECT LINK QUALITY (SNR)", maxw - 4)
+        stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+        row += 1
+        
+        stdscr.attron(curses.A_BOLD)
+        stdscr.addnstr(row, 4, "Best Links:", maxw - 6)
+        stdscr.attroff(curses.A_BOLD)
+        row += 1
+        if best_links:
+            for name, snr in best_links:
+                pair = 2 if snr >= 0 else 0
+                stdscr.addnstr(row, 6, f"{name}: {snr:+.1f} dB", maxw - 8, curses.color_pair(pair))
+                row += 1
+        else:
+            stdscr.addnstr(row, 6, "(no links recorded)", maxw - 8)
+            row += 1
+            
+        row += 1
+        stdscr.attron(curses.A_BOLD)
+        stdscr.addnstr(row, 4, "Worst Links:", maxw - 6)
+        stdscr.attroff(curses.A_BOLD)
+        row += 1
+        if worst_links:
+            for name, snr in worst_links:
+                pair = 1 if snr < -10 else 0
+                stdscr.addnstr(row, 6, f"{name}: {snr:+.1f} dB", maxw - 8, curses.color_pair(pair))
+                row += 1
+        else:
+            stdscr.addnstr(row, 6, "(no links recorded)", maxw - 8)
+            row += 1
+            
+        footer = "[n] nodes  [m] messages  [s] stats  [q] quit"
+        stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
+
     def _is_router(self, node_num) -> bool:
         # A node is a router if it connects ME to >= 2 nodes.
         # This includes itself (if direct/connected) and any other nodes that use it as a relay/hop.
