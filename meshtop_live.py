@@ -423,6 +423,8 @@ class MeshTopApp:
         self.trace_deadline = 0.0
         self.trace_cooldown_end = 0.0
         self._need_full_clear = False
+        self.auto_trace_active_node = None
+        self.auto_trace_in_progress = False
 
     # ---------- Connection and initial load ----------
 
@@ -732,26 +734,32 @@ class MeshTopApp:
                         node.last_route_snr_back = snr_back
                         node.last_route_time = time.time()
 
+                    is_auto = getattr(self, "auto_trace_in_progress", False)
+                    should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num == far_end)
+                    if should_update_ui:
+                        with self.trace_lock:
+                            self.trace_result = {
+                                "dest_num": far_end,
+                                "route": route,
+                                "snr_towards": snr_towards,
+                                "snr_back": snr_back,
+                                "ts": self.trace_started_at or time.time(),
+                                "error": None,
+                                "elapsed": time.time() - (self.trace_started_at or time.time()),
+                            }
+                        # allow quick re-run
+                        self.trace_deadline = 0.0
+                        self.trace_cooldown_end = time.time() + 0.5
+            except Exception as _e:
+                is_auto = getattr(self, "auto_trace_in_progress", False)
+                should_update_ui = not is_auto or (self.view_mode == "TRACE")
+                if should_update_ui:
                     with self.trace_lock:
-                        self.trace_result = {
-                            "dest_num": far_end,
-                            "route": route,
-                            "snr_towards": snr_towards,
-                            "snr_back": snr_back,
-                            "ts": self.trace_started_at or time.time(),
-                            "error": None,
-                            "elapsed": time.time() - (self.trace_started_at or time.time()),
-                        }
-                    # allow quick re-run
+                        self.trace_result = self.trace_result or {}
+                        self.trace_result["error"] = f"PARSE ERROR: {_e}"
+                        self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
                     self.trace_deadline = 0.0
                     self.trace_cooldown_end = time.time() + 0.5
-            except Exception as _e:
-                with self.trace_lock:
-                    self.trace_result = self.trace_result or {}
-                    self.trace_result["error"] = f"PARSE ERROR: {_e}"
-                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
-                self.trace_deadline = 0.0
-                self.trace_cooldown_end = time.time() + 0.5
 
         # ============================================================
         # 2) AFTER traceroute handling, skip non-text for the message log
@@ -918,6 +926,8 @@ class MeshTopApp:
         if h <= 0 or w <= 1:
             return
         maxw = w - 1
+        if getattr(self, "auto_trace_active_node", None):
+            text += f" | [Auto-tracing: {self.auto_trace_active_node}]"
         stdscr.attron(curses.A_REVERSE)
         stdscr.addnstr(0, 0, safe_text(text).ljust(maxw), maxw)
         stdscr.attroff(curses.A_REVERSE)
@@ -1681,8 +1691,56 @@ class MeshTopApp:
                 self._handle_msgs_keys(ch)
 
 
+    def _auto_trace_loop(self):
+        # Wait 30 seconds after startup to allow Nodedb to populate
+        time.sleep(30)
+        
+        while self.running:
+            with self.data_lock:
+                node_nums = [n for n in self.nodes.keys() if n != self.local_num]
+            
+            if node_nums:
+                self.auto_trace_in_progress = True
+                for num in node_nums:
+                    if not self.running:
+                        break
+                    
+                    with self.data_lock:
+                        node = self.nodes.get(num)
+                        if not node or node.is_me:
+                            continue
+                        dest = node.node_id or node.num
+                        node_name = node.short_name or node.long_name or f"#{node.num}"
+                    
+                    # Set active node indicator for the header
+                    self.auto_trace_active_node = node_name
+                    
+                    try:
+                        if self.iface:
+                            if hasattr(self.iface, "sendTraceRoute"):
+                                self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
+                            elif hasattr(self.iface, "traceroute"):
+                                self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
+                    except Exception:
+                        pass
+                    
+                    # Clear active indicator and pause slightly between nodes to avoid congestion
+                    self.auto_trace_active_node = None
+                    time.sleep(5)
+                
+                self.auto_trace_in_progress = False
+            
+            # Wait 15 minutes before the next cycle (check self.running in 1s steps)
+            for _ in range(900):
+                if not self.running:
+                    break
+                time.sleep(1)
+
     def run(self):
         self.connect()
+        # Start auto-trace daemon thread
+        self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True)
+        self.auto_trace_thread.start()
         curses.wrapper(self.run_curses)
 
 
