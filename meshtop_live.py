@@ -1724,6 +1724,10 @@ class MeshTopApp:
                         dest = node.node_id or node.num
                         node_name = node.short_name or node.long_name or f"#{node.num}"
                     
+                    # Wait if a manual user traceroute is active
+                    while self._trace_active() and self.running:
+                        time.sleep(1)
+
                     # Set active node indicator for the header
                     self.auto_trace_active_node = node_name
                     
@@ -1764,6 +1768,10 @@ class MeshTopApp:
                             if not node or getattr(node, "last_seen", 0) == 0:
                                 continue
                         
+                        # Wait if a manual user traceroute is active
+                        while self._trace_active() and self.running:
+                            time.sleep(1)
+
                         self.auto_trace_active_node = f"{node_name} (retry)"
                         
                         if self.iface and hasattr(self.iface, "_acknowledgment"):
