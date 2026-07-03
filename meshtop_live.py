@@ -1446,6 +1446,7 @@ class MeshTopApp:
                 stdscr.addnstr(row_y, right_x, line, right_w, attrs)
                 
         # Footer
+        footer = "[↑↓] select chat  [Enter] write  [n] nodes view  [s] stats view  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- Input handling ----------
