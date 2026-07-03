@@ -1344,16 +1344,14 @@ class MeshTopApp:
                 if _msg_involves_node(msg, n, self.local_id, self.local_num):
                     last_msg_ts[n.num] = max(last_msg_ts.get(n.num, 0), msg.timestamp)
                     
+        # Only keep nodes that have at least one message exchange
+        active_partners = [n for n in all_nodes if n.num in last_msg_ts]
+        
+        # Sort by last message timestamp descending
         def sort_key(n):
-            ts = last_msg_ts.get(n.num, 0)
-            if ts > 0:
-                return (0, -ts)  # active chats first
-            seen = getattr(n, "last_seen", 0) or 0
-            if seen > 0:
-                return (1, -seen)  # seen nodes next
-            return (2, n.short_name or n.node_id or str(n.num))
+            return -last_msg_ts[n.num]
             
-        return sorted(all_nodes, key=sort_key)
+        return sorted(active_partners, key=sort_key)
 
     def _draw_messages_view(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1367,7 +1365,7 @@ class MeshTopApp:
             stdscr.addnstr(
                 top,
                 0,
-                "(no seen nodes or chat partners available yet)".ljust(maxw),
+                "(no active conversations yet – start one by pressing Enter in NODES view)".ljust(maxw),
                 maxw,
             )
             footer = "[n] nodes view  [s] stats view  [q] quit"
