@@ -1327,7 +1327,7 @@ class MeshTopApp:
 
         self._draw_message_log(stdscr, start_row=h - 3, max_rows=2)
 
-        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] messages  [s] stats  [q] quit"
+        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] msgs  [s] stats  [p] export  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- MESSAGES view ----------
