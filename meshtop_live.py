@@ -1992,10 +1992,23 @@ class MeshTopApp:
                     seen_t = getattr(node, "last_seen", 0) or 0
                     if seen_t > 0:
                         last_att = last_attempt_times.get(num, 0)
-                        if now - last_att >= 86400:
-                            last_route_t = getattr(node, "last_route_time", 0) or 0
+                        last_route_t = getattr(node, "last_route_time", 0) or 0
+                        
+                        needs_trace = False
+                        if last_route_t > 0:
+                            # We have trace info. Rescan every 24 hours.
                             if now - last_route_t >= 86400:
-                                eligible_nodes.append((num, node.node_id or node.num, node.short_name or node.long_name or f"#{node.num}"))
+                                needs_trace = True
+                        else:
+                            # We do NOT have trace info. Try if never attempted,
+                            # or if heard from again since our last attempt (with a 5m cooldown).
+                            if last_att == 0:
+                                needs_trace = True
+                            elif seen_t > last_att and (now - last_att >= 300):
+                                needs_trace = True
+                                
+                        if needs_trace:
+                            eligible_nodes.append((num, node.node_id or node.num, node.short_name or node.long_name or f"#{node.num}"))
             
             if eligible_nodes:
                 try:
