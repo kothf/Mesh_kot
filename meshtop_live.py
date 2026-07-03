@@ -290,13 +290,25 @@ class MeshTopApp:
         Runs in a background thread so the curses UI never blocks.
         """
         try:
-            # Make the radio call (this can block)
-            if hasattr(self.iface, "sendTraceRoute"):
-                self.iface.sendTraceRoute(dest=dest, hopLimit=hop_limit, channelIndex=channel_index)
-            elif hasattr(self.iface, "traceroute"):
-                self.iface.traceroute(dest=dest, hopLimit=hop_limit, channelIndex=channel_index)
-            else:
-                raise AttributeError("Traceroute not supported by this meshtastic-python.")
+            if self.iface:
+                from meshtastic.protobuf import mesh_pb2, portnums_pb2
+                r = mesh_pb2.RouteDiscovery()
+                self.iface.sendData(
+                    r,
+                    destinationId=dest,
+                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                    wantResponse=True,
+                    onResponse=self.iface.onResponseTraceRoute,
+                    channelIndex=channel_index,
+                    hopLimit=hop_limit
+                )
+                # Wait up to 30 seconds for manual trace timeout
+                for _ in range(300):
+                    if not self.running:
+                        break
+                    if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
+                        break
+                    time.sleep(0.1)
         except Exception as e:
             with self.trace_lock:
                 if self.trace_result is not None:
@@ -425,8 +437,8 @@ class MeshTopApp:
         self.input_text = ""
         self.input_target_num: Optional[int] = None
         self.trace_thread = None
-        self.trace_lock = threading.Lock()
-        self.data_lock = threading.Lock()
+        self.trace_lock = threading.RLock()
+        self.data_lock = threading.RLock()
 
         # ---- add these ----
         self.trace_deadline = 0.0
