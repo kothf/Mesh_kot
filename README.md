@@ -1,15 +1,32 @@
 # Mesh_kot
 
-Meshtastic Live TUI (Text User Interface) application for viewing and monitoring Meshtastic nodes, messages, and signal traces.
+A powerful, interactive Meshtastic Live TUI (Text User Interface) application for viewing and monitoring Meshtastic nodes, real-time messages, and signal traces in a curses-based dashboard.
 
-## Features
+---
 
-- **Network Auto-Discovery**: Automatically scans your local `/24` subnet on port `4403` to find WiFi-connected Meshtastic devices.
-- **Interactive Selector**: If multiple Meshtastic devices are found, it prompts you to select one.
-- **Direct IP Connection**: Pass a specific host via parameters to bypass network scanning.
-- **Curses UI**: Interactive dashboard showing active nodes, battery levels, messages, and a signal trace.
+## 🚀 Key Features
 
-## Requirements
+* **Network Auto-Discovery**: Scans your local `/24` subnet on port `4403` to find WiFi-connected Meshtastic nodes, offering a menu if multiple nodes are discovered.
+* **Smart Background Auto-Tracer**:
+  * **Startup Wait**: Starts automatically once the first external node is heard from (heard/seen on mesh).
+  * **Dynamic Queueing**: Traces all seen nodes sequentially with a **30-second pause** between scans to avoid channel congestion.
+  * **Two-Pass Retry Loop**: Nodes that fail to respond are deferred to a retry queue and retried once at the end of the pass.
+  * **Selective 24h Cooldown**: Successfully traced nodes are placed on a **24-hour cooldown**. Unsuccessful traces are immediately rescheduled for retry if they exhibit new mesh activity (with a 5-minute safety cooldown).
+  * **Manual Lockout**: Suppresses manual traceroute requests when auto-trace is active (`TRACE suppressed (auto-trace active)`) to prevent packet collisions.
+* **Advanced Curses Visual Highlights**:
+  * 🟩 **Green Rows**: Automatically highlights transit router nodes (nodes serving as relays connecting your local node to $\ge 2$ target nodes).
+  * 🟥 **Red Highlights**: Marks nodes with low battery levels (**20% or lower**) to warn of power degradation.
+  * 🟨 **Yellow Rows**: Highlights your local node.
+* **📈 Stats View (`S` Key)**: A dedicated live dashboard showing:
+  * **Node Activity**: Total node count, active (seen in last 30 min), inactive (> 30 min), and unseen/dead.
+  * **Routing Statistics**: Total traced stations and calculated **Average Hop Count** of the active topology.
+  * **Link Quality (SNR)**: Shows the top 3 best direct links (green edge weights) and top 3 worst direct links (red edge weights) based on signal-to-noise ratio.
+* **🗺️ Network Topology Export (`P` Key)**: Generates a complete Mermaid diagram map showing all nodes, connections, hops, and SNR weights, exporting it locally to `topology.md`.
+* **📜 Route History Logging**: Appends all successful traceroute paths (including timestamp, destination ID, short name, hops, forward, and return SNR values) to a local `traces.jsonl` database for long-term telemetry analysis.
+
+---
+
+## 🛠️ Requirements
 
 Ensure you have Python 3 and the required dependencies installed:
 
@@ -17,15 +34,15 @@ Ensure you have Python 3 and the required dependencies installed:
 pip install meshtastic
 ```
 
-## How to Run
+---
 
-You can run the application using the provided startup script:
+## 🏃 How to Run
 
 1. **Auto-scan and Connect**:
    ```bash
    ./run.sh
    ```
-   This will automatically scan your local network for Meshtastic devices on port `4403`. If one is found, it connects immediately. If multiple are found, it displays a menu for selection.
+   This scans your local subnet for Meshtastic devices on port `4403`, connects automatically, or prompts you with a menu if multiple are found.
 
 2. **Connect to a Specific Device**:
    ```bash
@@ -37,11 +54,24 @@ You can run the application using the provided startup script:
    ./run.sh --host <device_ip> --port <custom_port>
    ```
 
-## Controls
+---
+
+## 🎮 Keyboard Controls
 
 Inside the dashboard:
-- **`n`**: Switch to Node List view
-- **`m`**: Switch to Messages list view
-- **`t`**: Switch to Signal Trace view
-- **`g` / `G`**: Toggle message filter (gibberish/system messages)
-- **`q` / `Q`**: Quit the application
+* **`n` / `N`**: Switch to **Nodes List** view.
+* **`m` / `M`**: Switch to **Messages List** view.
+* **`s` / `S`**: Switch to the **Stats Dashboard** view.
+* **`t` / `T`**: Switch to **Signal Trace** view (or retry/run a manual trace on the selected node).
+* **`p` / `P`**: Export the live network topology map to `topology.md` (usable from Nodes view).
+* **`g` / `G`**: Toggle message filtering (ON/OFF) to hide system messages/gibberish.
+* **`q` / `Q`**: Quit the application safely.
+
+---
+
+## 📂 Git & Runtime Files
+
+The repository is configured to exclude local runtime logs and databases via `.gitignore`:
+* `traces.jsonl`: Local database of all successful traceroute histories.
+* `topology.md`: Generated Mermaid graphs from your `P` export keypresses.
+* `*.log` & `__pycache__/`: Python cache and application execution logs.
