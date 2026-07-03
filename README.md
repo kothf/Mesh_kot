@@ -28,6 +28,7 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
   * **🌳 Network Connections Map**: A dynamic, recursive text tree graph showing how packets route through intermediate relays. It automatically ranks busier routers first, wraps the tree across multiple columns to utilize extra screen width, and supports vertical scrolling (`[↑/↓]` or `j`/`k`) to navigate larger topologies.
 * **🗺️ Network Topology Export (`P` Key)**: Generates a complete Mermaid diagram map showing all nodes, connections, hops, and SNR weights, exporting it locally to `topology.md`.
 * **📜 Route History Logging**: Appends all successful traceroute paths (including timestamp, destination ID, short name, hops, forward, and return SNR values) to a local `traces.jsonl` database for long-term telemetry analysis.
+* **💾 Traced Stations State Persistence**: Automatically saves all active node trace routes to `traced_stations.json`. On application startup, it reloads this data to restore the connections map immediately (unless the file is older than 24 hours).
 
 ---
 

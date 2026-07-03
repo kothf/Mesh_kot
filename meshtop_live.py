@@ -564,6 +564,7 @@ class MeshTopApp:
             self.nodes[self.local_num] = n
 
         self._update_all_distances()
+        self._load_traced_stations()
 
         # subscribe for live updates
         pub.subscribe(self.on_packet, "meshtastic.receive")
@@ -758,6 +759,7 @@ class MeshTopApp:
                         node.last_route_time = time.time()
 
                     self._log_trace_history(target_sender, route, snr_towards, snr_back)
+                    self._save_traced_stations()
 
                     is_auto = getattr(self, "auto_trace_in_progress", False)
                     should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num == far_end)
@@ -1620,6 +1622,77 @@ class MeshTopApp:
                 pkt_id=rec.get("msg_id")
             )
             self.messages.append(msg)
+
+    def _save_traced_stations(self):
+        """
+        Saves the last_route, last_route_snr_towards, last_route_snr_back,
+        and last_route_time for all nodes that have been traced to a local file.
+        """
+        try:
+            base_dir = Path(__file__).resolve().parent
+        except Exception:
+            base_dir = Path(".").resolve()
+            
+        file_path = base_dir / "traced_stations.json"
+        
+        data_to_save = {
+            "saved_at": time.time(),
+            "traces": {}
+        }
+        
+        with self.data_lock:
+            for num, node in self.nodes.items():
+                if getattr(node, "last_route_time", None) is not None and node.last_route_time > 0:
+                    data_to_save["traces"][str(num)] = {
+                        "last_route": node.last_route,
+                        "last_route_snr_towards": node.last_route_snr_towards,
+                        "last_route_snr_back": node.last_route_snr_back,
+                        "last_route_time": node.last_route_time
+                    }
+                    
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data_to_save, f, indent=4)
+        except Exception:
+            pass
+
+    def _load_traced_stations(self):
+        """
+        Loads the trace data from traced_stations.json if the file was saved
+        less than 24 hours ago.
+        """
+        try:
+            base_dir = Path(__file__).resolve().parent
+        except Exception:
+            base_dir = Path(".").resolve()
+            
+        file_path = base_dir / "traced_stations.json"
+        if not file_path.exists():
+            return
+            
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return
+            
+        saved_at = data.get("saved_at", 0)
+        if time.time() - saved_at >= 86400: # 24 hours in seconds
+            return
+            
+        traces = data.get("traces", {})
+        with self.data_lock:
+            for num_str, trace_info in traces.items():
+                try:
+                    num = int(num_str)
+                except ValueError:
+                    continue
+                    
+                node = self._get_or_create_node(num)
+                node.last_route = trace_info.get("last_route")
+                node.last_route_snr_towards = trace_info.get("last_route_snr_towards")
+                node.last_route_snr_back = trace_info.get("last_route_snr_back")
+                node.last_route_time = trace_info.get("last_route_time")
 
     def run_curses(self, stdscr):
         try:
