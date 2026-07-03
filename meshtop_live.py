@@ -1692,8 +1692,17 @@ class MeshTopApp:
 
 
     def _auto_trace_loop(self):
-        # Wait 30 seconds after startup to allow Nodedb to populate
-        time.sleep(30)
+        # Wait until the first non-local node is SEEN
+        while self.running:
+            has_seen_node = False
+            with self.data_lock:
+                for num, node in self.nodes.items():
+                    if num != self.local_num and not node.is_me and getattr(node, "last_seen", 0) > 0:
+                        has_seen_node = True
+                        break
+            if has_seen_node:
+                break
+            time.sleep(1)
         
         while self.running:
             with self.data_lock:
