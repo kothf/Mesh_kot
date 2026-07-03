@@ -1839,6 +1839,88 @@ class MeshTopApp:
         else:
             stdscr.addnstr(row, 6, "(no links recorded)", maxw - 8)
             row += 1
+
+        # --- Connections Map Tree Logic ---
+        tree = {}
+        for n in nodes_list:
+            if n.is_me or getattr(n, "last_route", None) is None:
+                continue
+            path = list(n.last_route) + [n.num]
+            curr = tree
+            for idx, step in enumerate(path):
+                if step not in curr:
+                    curr[step] = {"children": {}, "is_target": False, "snr": None}
+                if idx == len(path) - 1:
+                    curr[step]["is_target"] = True
+                    snrs = getattr(n, "last_route_snr_towards", []) or []
+                    if snrs and snrs[-1] is not None and snrs[-1] != -128:
+                        curr[step]["snr"] = snrs[-1] / 4.0
+                curr = curr[step]["children"]
+
+        def get_subtree_size(node_data):
+            return 1 + sum(get_subtree_size(v) for v in node_data["children"].values())
+
+        def format_tree(curr_tree, prefix=""):
+            lines = []
+            sorted_children = sorted(
+                curr_tree.items(),
+                key=lambda x: get_subtree_size(x[1]),
+                reverse=True
+            )
+            for idx, (num, data) in enumerate(sorted_children):
+                child_is_last = (idx == len(sorted_children) - 1)
+                marker = "└── " if child_is_last else "├── "
+                
+                with self.data_lock:
+                    n = self.nodes.get(num)
+                if n:
+                    name = n.short_name or n.node_id or f"#{num}"
+                else:
+                    name = f"#{num}"
+                    
+                snr_val = data["snr"]
+                snr_str = f" ({snr_val:+.1f}dB)" if snr_val is not None else ""
+                lines.append(f"{prefix}{marker}{name}{snr_str}")
+                
+                next_prefix = prefix + ("    " if child_is_last else "│   ")
+                lines.extend(format_tree(data["children"], next_prefix))
+            return lines
+
+        if not tree:
+            tree_lines = ["ME (Local Node)", " └── (no active trace routes yet)"]
+        else:
+            tree_lines = ["ME (Local Node)"]
+            tree_lines.extend(format_tree(tree, prefix=" "))
+
+        # Render tree dynamically depending on width
+        if w >= 80:
+            for y in range(2, h - 2):
+                stdscr.addch(y, 42, curses.ACS_VLINE)
+                
+            stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+            stdscr.addnstr(2, 44, "■ NETWORK CONNECTIONS MAP", w - 46)
+            stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+            
+            max_tree_height = h - 4 - 2
+            for idx, line in enumerate(tree_lines):
+                if idx >= max_tree_height:
+                    stdscr.addnstr(4 + idx, 44, "... (more nodes omitted)", w - 46)
+                    break
+                stdscr.addnstr(4 + idx, 44, line[:w-46], w - 46)
+        else:
+            if h - row >= 6:
+                row += 1
+                stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+                stdscr.addnstr(row, 2, "■ NETWORK CONNECTIONS MAP", maxw - 4)
+                stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+                row += 1
+                
+                max_tree_height = h - row - 2
+                for idx, line in enumerate(tree_lines):
+                    if idx >= max_tree_height:
+                        stdscr.addnstr(row + idx, 4, "... (more nodes omitted)", maxw - 6)
+                        break
+                    stdscr.addnstr(row + idx, 4, line[:maxw-6], maxw - 6)
             
         footer = "[n] nodes  [m] messages  [s] stats  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
@@ -1866,7 +1948,16 @@ class MeshTopApp:
                 
         return len(connected_nodes) >= 2
 
+    def _mermaid_node_id(self, node_num):
+        if node_num == self.local_num:
+            return "ME"
+        n = self.nodes.get(node_num)
+        if n and n.node_id:
+            return n.node_id.replace("!", "N")
+        return f"Node_{node_num}"
+
     def node_definition(self, node_num):
+        node_id = self._mermaid_node_id(node_num)
         if node_num == self.local_num:
             return 'ME["ME (Local Node)"]'
         n = self.nodes.get(node_num)
@@ -1874,9 +1965,9 @@ class MeshTopApp:
             label = f"{n.short_name or n.node_id or f'#{n.num}'}"
             if n.long_name:
                 label += f" ({n.long_name})"
-            return f'{n.node_id or f"#{n.num}"}["{label}"]'
+            return f'{node_id}["{label}"]'
         else:
-            return f'#{node_num}["#{node_num}"]'
+            return f'{node_id}["#{node_num}"]'
 
     def _export_topology(self):
         with self.data_lock:
@@ -1906,11 +1997,8 @@ class MeshTopApp:
                     
                 # Add edges
                 for i in range(len(path) - 1):
-                    n_from = self.nodes.get(path[i])
-                    n_to = self.nodes.get(path[i+1])
-                    
-                    id_from = n_from.node_id or f"#{n_from.num}" if n_from else f"#{path[i]}"
-                    id_to = n_to.node_id or f"#{n_to.num}" if n_to else f"#{path[i+1]}"
+                    id_from = self._mermaid_node_id(path[i])
+                    id_to = self._mermaid_node_id(path[i+1])
                     
                     # If it's the last hop, we can add SNR details if available
                     label = ""
@@ -1940,6 +2028,9 @@ class MeshTopApp:
             else:
                 lines.append(f"  {n_from} --> {n_to}")
                 
+        # Highlight local node in green
+        lines.append("  style ME fill:#2e7d32,stroke:#1b5e20,stroke-width:3px,color:#fff")
+        
         lines.append("```")
         content = "\n".join(lines)
         
