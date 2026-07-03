@@ -432,6 +432,7 @@ class MeshTopApp:
         # scrolling offsets
         self.node_view_offset = 0
         self.msg_view_offset = 0
+        self.stats_scroll_offset = 0
 
         self.input_mode = False
         self.input_text = ""
@@ -1531,6 +1532,21 @@ class MeshTopApp:
             partner = chat_partners[self.selected_chat_index]
             self._start_input(partner.num)
 
+    def _handle_stats_keys(self, ch):
+        if ch in (curses.KEY_UP, ord('k'), ord('K')):
+            if self.stats_scroll_offset > 0:
+                self.stats_scroll_offset -= 1
+                self._need_full_clear = True
+        elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
+            self.stats_scroll_offset += 1
+            self._need_full_clear = True
+        elif ch == curses.KEY_NPAGE: # Page Down
+            self.stats_scroll_offset += 10
+            self._need_full_clear = True
+        elif ch == curses.KEY_PPAGE: # Page Up
+            self.stats_scroll_offset = max(0, self.stats_scroll_offset - 10)
+            self._need_full_clear = True
+
     # ---------- curses main loop ----------
 
     def _load_archived_messages(self, max_lines: int = 1000):
@@ -1733,6 +1749,8 @@ class MeshTopApp:
                 self._handle_nodes_keys(ch)
             elif self.view_mode == "TRACE":
                 self._handle_trace_keys(ch)
+            elif self.view_mode == "STATS":
+                self._handle_stats_keys(ch)
             else:
                 self._handle_msgs_keys(ch)
     def _log_trace_history(self, dest_num, route, snr_towards, snr_back):
@@ -1915,6 +1933,15 @@ class MeshTopApp:
             tree_lines = ["ME (Local Node)"]
             tree_lines.extend(format_tree(tree, prefix=" "))
 
+        # Clamp scroll offset
+        max_scroll = max(0, len(tree_lines) - 1)
+        if self.stats_scroll_offset > max_scroll:
+            self.stats_scroll_offset = max_scroll
+        if self.stats_scroll_offset < 0:
+            self.stats_scroll_offset = 0
+
+        visible_lines = tree_lines[self.stats_scroll_offset:]
+
         # Render tree dynamically depending on width
         if w >= 80:
             for y in range(2, h - 2):
@@ -1925,11 +1952,23 @@ class MeshTopApp:
             stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
             
             max_tree_height = h - 4 - 2
-            for idx, line in enumerate(tree_lines):
-                if idx >= max_tree_height:
-                    stdscr.addnstr(4 + idx, 44, "... (more nodes omitted)", w - 46)
-                    break
-                stdscr.addnstr(4 + idx, 44, line[:w-46], w - 46)
+            col_width = 35
+            w_avail = w - 44
+            num_cols = max(1, w_avail // col_width)
+            
+            for col_idx in range(num_cols):
+                col_x = 44 + col_idx * col_width
+                start = col_idx * max_tree_height
+                end = (col_idx + 1) * max_tree_height
+                col_lines = visible_lines[start:end]
+                
+                for idx, line in enumerate(col_lines):
+                    stdscr.addnstr(4 + idx, col_x, line, col_width - 3)
+                    
+            total_slots = num_cols * max_tree_height
+            if len(visible_lines) > total_slots:
+                last_col_x = 44 + (num_cols - 1) * col_width
+                stdscr.addnstr(h - 3, last_col_x, "[...↓ more]", col_width - 3, curses.color_pair(3) | curses.A_REVERSE)
         else:
             if h - row >= 6:
                 row += 1
@@ -1939,13 +1978,24 @@ class MeshTopApp:
                 row += 1
                 
                 max_tree_height = h - row - 2
-                for idx, line in enumerate(tree_lines):
-                    if idx >= max_tree_height:
-                        stdscr.addnstr(row + idx, 4, "... (more nodes omitted)", maxw - 6)
-                        break
-                    stdscr.addnstr(row + idx, 4, line[:maxw-6], maxw - 6)
+                col_width = 35
+                num_cols = max(1, w // col_width)
+                
+                for col_idx in range(num_cols):
+                    col_x = 4 + col_idx * col_width
+                    start = col_idx * max_tree_height
+                    end = (col_idx + 1) * max_tree_height
+                    col_lines = visible_lines[start:end]
+                    
+                    for idx, line in enumerate(col_lines):
+                        stdscr.addnstr(row + idx, col_x, line, col_width - 3)
+                        
+                total_slots = num_cols * max_tree_height
+                if len(visible_lines) > total_slots:
+                    last_col_x = 4 + (num_cols - 1) * col_width
+                    stdscr.addnstr(row + max_tree_height - 1, last_col_x, "[...↓ more]", col_width - 3, curses.color_pair(3) | curses.A_REVERSE)
             
-        footer = "[n] nodes  [m] messages  [s] stats  [q] quit"
+        footer = "[n] nodes  [m] messages  [s] stats  [↑/↓] scroll tree  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     def _is_router(self, node_num) -> bool:

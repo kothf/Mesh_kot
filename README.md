@@ -25,7 +25,7 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
   * **Node Activity**: Total node count, active (seen in last 30 min), inactive (> 30 min), and unseen/dead.
   * **Routing Statistics**: Total traced stations and calculated **Average Hop Count** of the active topology.
   * **Link Quality (SNR)**: Shows the top 3 best direct links (green edge weights) and top 3 worst direct links (red edge weights).
-  * **🌳 Network Connections Map**: A dynamic, recursive text tree graph showing how packets route through intermediate relays. It automatically ranks busier routers first and scales/omits leaf nodes to fit your screen height.
+  * **🌳 Network Connections Map**: A dynamic, recursive text tree graph showing how packets route through intermediate relays. It automatically ranks busier routers first, wraps the tree across multiple columns to utilize extra screen width, and supports vertical scrolling (`[↑/↓]` or `j`/`k`) to navigate larger topologies.
 * **🗺️ Network Topology Export (`P` Key)**: Generates a complete Mermaid diagram map showing all nodes, connections, hops, and SNR weights, exporting it locally to `topology.md`.
 * **📜 Route History Logging**: Appends all successful traceroute paths (including timestamp, destination ID, short name, hops, forward, and return SNR values) to a local `traces.jsonl` database for long-term telemetry analysis.
 
