@@ -1752,9 +1752,9 @@ class MeshTopApp:
                     if not answered:
                         no_answer_nodes.append((num, dest, node_name))
                     
-                    # Clear active indicator and pause slightly between nodes
+                    # Clear active indicator and pause 30 seconds between nodes
                     self.auto_trace_active_node = None
-                    time.sleep(5)
+                    time.sleep(30)
                 
                 # --- PASS 2: Return to no-answer nodes ---
                 if no_answer_nodes and self.running:
@@ -1787,12 +1787,12 @@ class MeshTopApp:
                             pass
                         
                         self.auto_trace_active_node = None
-                        time.sleep(5)
+                        time.sleep(30)
                 
                 self.auto_trace_in_progress = False
             
-            # Wait 5 minutes before the next cycle (check self.running in 1s steps)
-            for _ in range(300):
+            # Wait 24 hours before the next cycle (check self.running in 1s steps)
+            for _ in range(86400):
                 if not self.running:
                     break
                 time.sleep(1)
