@@ -1205,6 +1205,8 @@ class MeshTopApp:
                 attrs |= curses.A_REVERSE
             if node.is_me:
                 attrs |= curses.color_pair(3)
+            elif self._is_router(node.num):
+                attrs |= curses.color_pair(2)
             if node.battery_low:
                 attrs |= curses.color_pair(1)
 
@@ -1485,6 +1487,8 @@ class MeshTopApp:
                 self.view_mode = "TRACE"
                 self._need_full_clear = True  # <— add this
                 self._send_trace_to_current()
+        elif ch in (ord('p'), ord('P')):
+            self._export_topology()
 
 
 
@@ -1590,6 +1594,7 @@ class MeshTopApp:
             # init pairs (use 4 for blue to avoid clashes)
             try:
                 curses.init_pair(1, curses.COLOR_RED, -1)  # low battery
+                curses.init_pair(2, curses.COLOR_GREEN, -1)  # router nodes
                 curses.init_pair(3, curses.COLOR_YELLOW, -1)  # my node
                 curses.init_pair(4, curses.COLOR_BLUE, -1)  # messages to me (pair 4)
             except curses.error:
@@ -1697,7 +1702,128 @@ class MeshTopApp:
                 self._handle_trace_keys(ch)
             else:
                 self._handle_msgs_keys(ch)
+    def _is_router(self, node_num) -> bool:
+        # A node is a router if it connects ME to >= 2 nodes.
+        # This includes itself (if direct/connected) and any other nodes that use it as a relay/hop.
+        if node_num == self.local_num:
+            return False
+        
+        connected_nodes = set()
+        
+        # 1. If we have a route to this node, it is connected to us.
+        node = self.nodes.get(node_num)
+        if node and getattr(node, "last_route", None) is not None:
+            connected_nodes.add(node_num)
+            
+        # 2. Add all other nodes that have this node in their path
+        for num, n in self.nodes.items():
+            if num == self.local_num or num == node_num:
+                continue
+            route = getattr(n, "last_route", None)
+            if route and node_num in route:
+                connected_nodes.add(num)
+                
+        return len(connected_nodes) >= 2
 
+    def node_definition(self, node_num):
+        if node_num == self.local_num:
+            return 'ME["ME (Local Node)"]'
+        n = self.nodes.get(node_num)
+        if n:
+            label = f"{n.short_name or n.node_id or f'#{n.num}'}"
+            if n.long_name:
+                label += f" ({n.long_name})"
+            return f'{n.node_id or f"#{n.num}"}["{label}"]'
+        else:
+            return f'#{node_num}["#{node_num}"]'
+
+    def _export_topology(self):
+        with self.data_lock:
+            nodes_list = list(self.nodes.values())
+        
+        node_defs = set()
+        edges = set()
+        
+        # Add local node
+        node_defs.add(self.node_definition(self.local_num))
+        
+        for node in nodes_list:
+            if node.is_me:
+                continue
+            
+            route = getattr(node, "last_route", None)
+            if route is not None:
+                # Add definition for target node
+                node_defs.add(self.node_definition(node.num))
+                
+                # Build hop path: ME -> Hop1 -> Hop2 -> ... -> Target
+                path = [self.local_num] + list(route) + [node.num]
+                
+                # Add definitions for all intermediate hops
+                for num in route:
+                    node_defs.add(self.node_definition(num))
+                    
+                # Add edges
+                for i in range(len(path) - 1):
+                    n_from = self.nodes.get(path[i])
+                    n_to = self.nodes.get(path[i+1])
+                    
+                    id_from = n_from.node_id or f"#{n_from.num}" if n_from else f"#{path[i]}"
+                    id_to = n_to.node_id or f"#{n_to.num}" if n_to else f"#{path[i+1]}"
+                    
+                    # If it's the last hop, we can add SNR details if available
+                    label = ""
+                    if i == len(path) - 2:
+                        snrs = getattr(node, "last_route_snr_towards", []) or []
+                        if snrs and snrs[-1] is not None and snrs[-1] != -128:
+                            label = f"{snrs[-1]/4.0:+.1f}dB"
+                    
+                    edges.add((id_from, id_to, label))
+                    
+        # Generate content
+        lines = []
+        lines.append("# Meshtastic Network Topology")
+        lines.append(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        lines.append("```mermaid")
+        lines.append("graph TD")
+        
+        # Node definitions
+        for d in sorted(node_defs):
+            lines.append(f"  {d}")
+        lines.append("")
+        
+        # Edges
+        for n_from, n_to, label in sorted(edges):
+            if label:
+                lines.append(f"  {n_from} -->|{label}| {n_to}")
+            else:
+                lines.append(f"  {n_from} --> {n_to}")
+                
+        lines.append("```")
+        content = "\n".join(lines)
+        
+        # Write to file
+        filepath = "/home/pinkfloyd/Mesh_kot/topology.md"
+        try:
+            with open(filepath, "w") as f:
+                f.write(content)
+            
+            notification = MessageInfo(
+                timestamp=time.time(),
+                direction="IN",
+                from_id="SYSTEM",
+                from_short="SYS",
+                to_id="ME",
+                to_short="ME",
+                text=f"Network topology exported to topology.md",
+                portnum="TEXT_MESSAGE_APP",
+                status="RECEIVED"
+            )
+            
+            with self.data_lock:
+                self.messages.append(notification)
+        except Exception:
+            pass
 
     def _auto_trace_loop(self):
         # Wait until the first non-local node is SEEN
