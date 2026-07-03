@@ -734,15 +734,16 @@ class MeshTopApp:
                     snr_towards = _ints(rd_dict.get("snrTowards") or rd_dict.get("snr_forward"))
                     snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
 
-                    far_end = route[-1] if route else packet.get("from")
-                    for num_to_update in set(filter(None, [far_end, self.trace_target_num])):
+                    target_sender = packet.get("from")
+                    far_end = route[-1] if route else target_sender
+                    for num_to_update in set(filter(None, [target_sender, far_end, self.trace_target_num])):
                         node = self._get_or_create_node(num_to_update)
                         node.last_route = route
                         node.last_route_snr_towards = snr_towards
                         node.last_route_snr_back = snr_back
                         node.last_route_time = time.time()
 
-                    self._log_trace_history(far_end, route, snr_towards, snr_back)
+                    self._log_trace_history(target_sender, route, snr_towards, snr_back)
 
                     is_auto = getattr(self, "auto_trace_in_progress", False)
                     should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num == far_end)
