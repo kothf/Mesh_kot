@@ -1983,71 +1983,30 @@ class MeshTopApp:
                 node_nums = [n for n, node in self.nodes.items() if n != self.local_num and getattr(node, "last_seen", 0) > 0]
             
             if node_nums:
-                self.auto_trace_in_progress = True
-                no_answer_nodes = []
-                
-                # --- PASS 1: Trace all seen nodes ---
-                for num in node_nums:
-                    if not self.running:
-                        break
+                try:
+                    self.auto_trace_in_progress = True
+                    no_answer_nodes = []
                     
-                    with self.data_lock:
-                        node = self.nodes.get(num)
-                        if not node or node.is_me or getattr(node, "last_seen", 0) == 0:
-                            continue
-                        dest = node.node_id or node.num
-                        node_name = node.short_name or node.long_name or f"#{node.num}"
-                    
-                    # Wait if a manual user traceroute is active
-                    while self._trace_active() and self.running:
-                        time.sleep(1)
-
-                    # Set active node indicator for the header
-                    self.auto_trace_active_node = node_name
-                    
-                    # Clear acknowledgment flag before trace
-                    if self.iface and hasattr(self.iface, "_acknowledgment"):
-                        self.iface._acknowledgment.receivedTraceRoute = False
-                    
-                    try:
-                        if self.iface:
-                            if hasattr(self.iface, "sendTraceRoute"):
-                                self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
-                            elif hasattr(self.iface, "traceroute"):
-                                self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
-                    except Exception:
-                        pass
-                    
-                    # Check if answered
-                    answered = False
-                    if self.iface and hasattr(self.iface, "_acknowledgment"):
-                        answered = self.iface._acknowledgment.receivedTraceRoute
-                    
-                    if not answered:
-                        no_answer_nodes.append((num, dest, node_name))
-                    
-                    # Clear active indicator and pause 30 seconds between nodes
-                    self.auto_trace_active_node = None
-                    time.sleep(30)
-                
-                # --- PASS 2: Return to no-answer nodes ---
-                if no_answer_nodes and self.running:
-                    for num, dest, node_name in no_answer_nodes:
+                    # --- PASS 1: Trace all seen nodes ---
+                    for num in node_nums:
                         if not self.running:
                             break
                         
-                        # Verify the node is still valid
                         with self.data_lock:
                             node = self.nodes.get(num)
-                            if not node or getattr(node, "last_seen", 0) == 0:
+                            if not node or node.is_me or getattr(node, "last_seen", 0) == 0:
                                 continue
+                            dest = node.node_id or node.num
+                            node_name = node.short_name or node.long_name or f"#{node.num}"
                         
                         # Wait if a manual user traceroute is active
                         while self._trace_active() and self.running:
                             time.sleep(1)
 
-                        self.auto_trace_active_node = f"{node_name} (retry)"
+                        # Set active node indicator for the header
+                        self.auto_trace_active_node = node_name
                         
+                        # Clear acknowledgment flag before trace
                         if self.iface and hasattr(self.iface, "_acknowledgment"):
                             self.iface._acknowledgment.receivedTraceRoute = False
                         
@@ -2060,10 +2019,53 @@ class MeshTopApp:
                         except Exception:
                             pass
                         
+                        # Check if answered
+                        answered = False
+                        if self.iface and hasattr(self.iface, "_acknowledgment"):
+                            answered = self.iface._acknowledgment.receivedTraceRoute
+                        
+                        if not answered:
+                            no_answer_nodes.append((num, dest, node_name))
+                        
+                        # Clear active indicator and pause 30 seconds between nodes
                         self.auto_trace_active_node = None
                         time.sleep(30)
-                
-                self.auto_trace_in_progress = False
+                    
+                    # --- PASS 2: Return to no-answer nodes ---
+                    if no_answer_nodes and self.running:
+                        for num, dest, node_name in no_answer_nodes:
+                            if not self.running:
+                                break
+                            
+                            # Verify the node is still valid
+                            with self.data_lock:
+                                node = self.nodes.get(num)
+                                if not node or getattr(node, "last_seen", 0) == 0:
+                                    continue
+                            
+                            # Wait if a manual user traceroute is active
+                            while self._trace_active() and self.running:
+                                time.sleep(1)
+
+                            self.auto_trace_active_node = f"{node_name} (retry)"
+                            
+                            if self.iface and hasattr(self.iface, "_acknowledgment"):
+                                self.iface._acknowledgment.receivedTraceRoute = False
+                            
+                            try:
+                                if self.iface:
+                                    if hasattr(self.iface, "sendTraceRoute"):
+                                        self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
+                                    elif hasattr(self.iface, "traceroute"):
+                                        self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
+                            except Exception:
+                                pass
+                            
+                            self.auto_trace_active_node = None
+                            time.sleep(30)
+                finally:
+                    self.auto_trace_active_node = None
+                    self.auto_trace_in_progress = False
             
             # Wait 24 hours before the next cycle (check self.running in 1s steps)
             for _ in range(86400):
