@@ -1697,7 +1697,7 @@ class MeshTopApp:
         
         while self.running:
             with self.data_lock:
-                node_nums = [n for n in self.nodes.keys() if n != self.local_num]
+                node_nums = [n for n, node in self.nodes.items() if n != self.local_num and getattr(node, "last_seen", 0) > 0]
             
             if node_nums:
                 self.auto_trace_in_progress = True
@@ -1707,7 +1707,7 @@ class MeshTopApp:
                     
                     with self.data_lock:
                         node = self.nodes.get(num)
-                        if not node or node.is_me:
+                        if not node or node.is_me or getattr(node, "last_seen", 0) == 0:
                             continue
                         dest = node.node_id or node.num
                         node_name = node.short_name or node.long_name or f"#{node.num}"
@@ -1730,8 +1730,8 @@ class MeshTopApp:
                 
                 self.auto_trace_in_progress = False
             
-            # Wait 15 minutes before the next cycle (check self.running in 1s steps)
-            for _ in range(900):
+            # Wait 5 minutes before the next cycle (check self.running in 1s steps)
+            for _ in range(300):
                 if not self.running:
                     break
                 time.sleep(1)
