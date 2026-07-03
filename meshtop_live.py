@@ -1641,7 +1641,7 @@ class MeshTopApp:
 
             if self.input_mode:
                 if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, q quit)")
+                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, p export, q quit)")
                     self._draw_nodes_view(stdscr)
                 elif self.view_mode == "TRACE":
                     self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
@@ -1649,7 +1649,7 @@ class MeshTopApp:
                 else:
                     # where you draw the MESSAGES header:
                     self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, s stats, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+                                      f"meshtop – MESSAGES (n nodes, s stats, p export, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
 
                     self._draw_messages_view(stdscr)
 
@@ -1661,18 +1661,18 @@ class MeshTopApp:
                 stdscr.move(h - 2, min(maxw - 1, len(prompt) + len(txt)))
             else:
                 if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, q quit)")
+                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, p export, q quit)")
                     self._draw_nodes_view(stdscr)
                 elif self.view_mode == "TRACE":
                     self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
                     self._draw_trace_view(stdscr)
                 elif self.view_mode == "STATS":
-                    self._draw_header(stdscr, "meshtop – STATS (n nodes, m messages, q quit)")
+                    self._draw_header(stdscr, "meshtop – STATS (n nodes, m messages, p export, q quit)")
                     self._draw_stats_view(stdscr)
                 else:
                     # where you draw the MESSAGES header:
                     self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, s stats, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+                                      f"meshtop – MESSAGES (n nodes, s stats, p export, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
 
                     self._draw_messages_view(stdscr)
 
@@ -2013,10 +2013,26 @@ class MeshTopApp:
                         
                         try:
                             if self.iface:
-                                if hasattr(self.iface, "sendTraceRoute"):
-                                    self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
-                                elif hasattr(self.iface, "traceroute"):
-                                    self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
+                                from meshtastic.protobuf import mesh_pb2, portnums_pb2
+                                r = mesh_pb2.RouteDiscovery()
+                                self.iface.sendData(
+                                    r,
+                                    destinationId=dest,
+                                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                    wantResponse=True,
+                                    onResponse=self.iface.onResponseTraceRoute,
+                                    channelIndex=0,
+                                    hopLimit=7
+                                )
+                                # Custom short timeout wait loop (e.g. max 12 seconds)
+                                for _ in range(120):  # 120 * 0.1s = 12s
+                                    if not self.running:
+                                        break
+                                    if self._trace_active():
+                                        break
+                                    if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
+                                        break
+                                    time.sleep(0.1)
                         except Exception:
                             pass
                         
@@ -2055,10 +2071,26 @@ class MeshTopApp:
                             
                             try:
                                 if self.iface:
-                                    if hasattr(self.iface, "sendTraceRoute"):
-                                        self.iface.sendTraceRoute(dest=dest, hopLimit=7, channelIndex=0)
-                                    elif hasattr(self.iface, "traceroute"):
-                                        self.iface.traceroute(dest=dest, hopLimit=7, channelIndex=0)
+                                    from meshtastic.protobuf import mesh_pb2, portnums_pb2
+                                    r = mesh_pb2.RouteDiscovery()
+                                    self.iface.sendData(
+                                        r,
+                                        destinationId=dest,
+                                        portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                                        wantResponse=True,
+                                        onResponse=self.iface.onResponseTraceRoute,
+                                        channelIndex=0,
+                                        hopLimit=7
+                                    )
+                                    # Custom short timeout wait loop (e.g. max 12 seconds)
+                                    for _ in range(120):  # 120 * 0.1s = 12s
+                                        if not self.running:
+                                            break
+                                        if self._trace_active():
+                                            break
+                                        if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
+                                            break
+                                        time.sleep(0.1)
                             except Exception:
                                 pass
                             
