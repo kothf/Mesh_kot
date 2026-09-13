@@ -94,18 +94,39 @@ class MessageArchiver:
         self._size = 0  # start counting fresh
 
     def write(self, record: dict):
+        # copy dict to avoid mutating caller's data
+        rec_copy = dict(record)
         # sanitize controls in 'text'
-        txt = record.get('text')
+        txt = rec_copy.get('text')
         if isinstance(txt, str):
-            record['text'] = ''.join(ch if (ch >= ' ' or ch in '\n\t') else '\uFFFD' for ch in txt)
-        line = json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n'
+            rec_copy['text'] = ''.join(ch if (ch >= ' ' or ch in '\n\t') else '\uFFFD' for ch in txt)
+        line = json.dumps(rec_copy, ensure_ascii=False, separators=(',', ':')) + '\n'
         data = line.encode('utf-8')
         with self._lock:
+            if self._fh is None or getattr(self._fh, 'closed', False):
+                self._init_seq_and_open()
             self._rotate_if_needed(len(data))
             self._fh.write(line)
             self._fh.flush()
             self._size += len(data)
 
+    def close(self):
+        with self._lock:
+            if self._fh is not None and not getattr(self._fh, 'closed', False):
+                try:
+                    self._fh.flush()
+                    self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     @staticmethod
     def now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
+

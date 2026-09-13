@@ -99,7 +99,6 @@ def looks_like_human_text(s: str) -> bool:
     s = s.replace("\x00", "")
 
     # Hard garbage: a single char repeated 21+ times (e.g., "%%%%%%%%%%%%%%%")
-    import re, unicodedata
     if re.search(r'(.)\1{20,}', s):
         return False
 
@@ -221,6 +220,9 @@ def _hops_line(names: List[str], snrs_raw: List[Optional[int]], maxw: int) -> st
 
 def haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
     if None in (lat1, lon1, lat2, lon2):
+        return None
+    # 0.0, 0.0 indicates uninitialized or missing GPS fix in Meshtastic
+    if (lat1 == 0.0 and lon1 == 0.0) or (lat2 == 0.0 and lon2 == 0.0):
         return None
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -725,15 +727,19 @@ class MeshTopApp:
                 payload = d.get("payload")
                 rd_dict = None
 
-                # Case A: some builds include a decoded dict in the message
-                for k in ("routeDiscovery", "traceroute", "route_tracer", "route"):
+                # Case A: some builds include a decoded sub-dict in the message
+                for k in ("routeDiscovery", "traceroute", "route_tracer"):
                     v = d.get(k)
                     if isinstance(v, dict) and any(
                             x in v for x in ("route", "snrTowards", "snrBack", "snr_forward", "snr_return")):
                         rd_dict = v
                         break
 
-                # Case B: payload is a protobuf RouteDiscovery
+                # Case B: decoded dict itself directly contains route fields
+                if rd_dict is None and any(x in d for x in ("route", "snrTowards", "snrBack", "snr_forward", "snr_return")):
+                    rd_dict = d
+
+                # Case C: payload is a protobuf RouteDiscovery
                 if rd_dict is None and isinstance(payload, (bytes, bytearray)):
                     rd = mesh_pb2.RouteDiscovery()
                     rd.ParseFromString(payload)
@@ -743,30 +749,44 @@ class MeshTopApp:
                     def _ints(v):
                         if not v:
                             return []
-                        return v if all(isinstance(x, int) for x in v) else [int(x) for x in v]
+                        res = []
+                        for x in v:
+                            try:
+                                res.append(int(x))
+                            except (ValueError, TypeError):
+                                pass
+                        return res
 
                     route = _ints(rd_dict.get("route"))
                     snr_towards = _ints(rd_dict.get("snrTowards") or rd_dict.get("snr_forward"))
                     snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
 
                     target_sender = packet.get("from")
-                    far_end = route[-1] if route else target_sender
-                    for num_to_update in set(filter(None, [target_sender, far_end, self.trace_target_num])):
-                        node = self._get_or_create_node(num_to_update)
+                    # In Meshtastic, route contains intermediate hops; the responding destination is target_sender
+                    dest_num = self.trace_target_num or target_sender
+                    if dest_num:
+                        node = self._get_or_create_node(dest_num)
                         node.last_route = route
                         node.last_route_snr_towards = snr_towards
                         node.last_route_snr_back = snr_back
                         node.last_route_time = time.time()
 
-                    self._log_trace_history(target_sender, route, snr_towards, snr_back)
+                    if target_sender and target_sender != dest_num:
+                        node = self._get_or_create_node(target_sender)
+                        node.last_route = route
+                        node.last_route_snr_towards = snr_towards
+                        node.last_route_snr_back = snr_back
+                        node.last_route_time = time.time()
+
+                    self._log_trace_history(dest_num or target_sender, route, snr_towards, snr_back)
                     self._save_traced_stations()
 
                     is_auto = getattr(self, "auto_trace_in_progress", False)
-                    should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num == far_end)
+                    should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num in (dest_num, target_sender))
                     if should_update_ui:
                         with self.trace_lock:
                             self.trace_result = {
-                                "dest_num": far_end,
+                                "dest_num": dest_num,
                                 "route": route,
                                 "snr_towards": snr_towards,
                                 "snr_back": snr_back,
@@ -866,9 +886,13 @@ class MeshTopApp:
     # ---------- Sending text ----------
 
     def send_text_to_node(self, target_num: int, text: str):
+        with self.data_lock:
+            node = self.nodes.get(target_num)
+            to_id = (node.node_id if node and node.node_id else f"#{target_num}")
+            to_short = (node.short_name if node and node.short_name else "?")
+
         # best-effort outbound log (pre-send)
         try:
-            to_id = self.nodes.get(target_num).node_id if self.nodes.get(target_num) else f'#{target_num}'
             self.archiver.write({
                 'ts_iso': MessageArchiver.now_iso(),
                 'direction': 'OUT',
@@ -885,18 +909,14 @@ class MeshTopApp:
                 'channel': 0,
                 'errors': []
             })
-        except Exception as _e:
-            import sys
-            print(f"[archiver] outbound pre-log failed: {_e}", file=sys.stderr)
-        if not self.iface:
-            return
-        with self.data_lock:
-            node = self.nodes.get(target_num)
-        if not node:
+        except Exception:
+            pass
+
+        if not self.iface or not node:
             return
 
-        if not node.node_id:
-            # can't send without node_id
+        dest = node.node_id or node.num
+        if not dest:
             with self.data_lock:
                 self.messages.append(
                     MessageInfo(
@@ -905,14 +925,15 @@ class MeshTopApp:
                         from_id=self.local_id or "^local",
                         from_short=self.local_short,
                         to_id=f"#{target_num}",
-                        to_short=node.short_name or "?",
-                        text="[ERROR: node has no node_id]",
+                        to_short=to_short,
+                        text="[ERROR: invalid target node]",
                         status="UNKNOWN",
                     )
                 )
             return
 
         clean_text = safe_text(text)
+        target_display_id = node.node_id or f"#{node.num}"
 
         # append to log immediately
         with self.data_lock:
@@ -922,15 +943,15 @@ class MeshTopApp:
                     direction="OUT",
                     from_id=self.local_id or "^local",
                     from_short=self.local_short,
-                    to_id=node.node_id,
-                    to_short=node.short_name,
+                    to_id=target_display_id,
+                    to_short=to_short,
                     text=clean_text,
                     status="SENT",
                 )
             )
 
         try:
-            self.iface.sendText(clean_text, destinationId=node.node_id, wantAck=True)
+            self.iface.sendText(clean_text, destinationId=dest, wantAck=True)
         except Exception as e:
             with self.data_lock:
                 self.messages.append(
@@ -939,8 +960,8 @@ class MeshTopApp:
                         direction="OUT",
                         from_id=self.local_id or "^local",
                         from_short=self.local_short,
-                        to_id=node.node_id,
-                        to_short=node.short_name,
+                        to_id=target_display_id,
+                        to_short=to_short,
                         text=f"[SEND ERROR: {e}]",
                         status="UNKNOWN",
                     )
@@ -986,8 +1007,6 @@ class MeshTopApp:
             text_space = max(10, maxw - len(prefix) - 1)
             text = safe_text(msg.text)[:text_space]
 
-            # build the rendered line
-            # build the rendered line
             # build the rendered line
             line = (prefix + text).ljust(maxw)
 
@@ -1351,31 +1370,36 @@ class MeshTopApp:
         with self.data_lock:
             all_nodes = [node for node in self.nodes.values() if not node.is_me and node.num != self.local_num]
             messages = list(self.messages)
-            
-        # Find the last message timestamp for each node num
+
+        id_to_node = {}
+        for n in all_nodes:
+            nid = _norm(n.node_id)
+            if nid:
+                id_to_node[nid] = n
+            id_to_node[str(n.num)] = n
+
         last_msg_ts = {}
         for msg in messages:
-            for n in all_nodes:
-                if _msg_involves_node(msg, n, self.local_id, self.local_num):
-                    last_msg_ts[n.num] = max(last_msg_ts.get(n.num, 0), msg.timestamp)
-                    
-        # Only keep nodes that have at least one message exchange
+            f = _norm(msg.from_id)
+            t = _norm(msg.to_id)
+            partner = id_to_node.get(f) or id_to_node.get(t)
+            if partner:
+                last_msg_ts[partner.num] = max(last_msg_ts.get(partner.num, 0), msg.timestamp)
+
         active_partners = [n for n in all_nodes if n.num in last_msg_ts]
-        
-        # Sort by last message timestamp descending
-        def sort_key(n):
-            return -last_msg_ts[n.num]
-            
-        return sorted(active_partners, key=sort_key)
+        active_partners.sort(key=lambda n: -last_msg_ts[n.num])
+        return active_partners
 
     def _draw_messages_view(self, stdscr):
         h, w = stdscr.getmaxyx()
+        if h < 8 or w < 40:
+            return
         maxw = w - 1
         top = 1
         self._wipe_body(stdscr)
-        
+
         chat_partners = self._get_chat_partners()
-        
+
         if not chat_partners:
             stdscr.addnstr(
                 top,
@@ -1386,36 +1410,39 @@ class MeshTopApp:
             footer = "[n] nodes view  [s] stats view  [q] quit"
             stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
             return
-            
+
         # Clamp selection index
         self.selected_chat_index = max(0, min(self.selected_chat_index, len(chat_partners) - 1))
         active_partner = chat_partners[self.selected_chat_index]
-        
+
         # Split layout columns
         left_w = 22
         right_x = 24
-        
+
         # --- Draw Left Column: Conversations List ---
-        left_avail_rows = h - 3
         for idx, partner in enumerate(chat_partners):
             row_y = top + idx
             if row_y >= h - 1:
                 break
-                
+
             name = partner.short_name or partner.node_id or f"#{partner.num}"
             if len(name) > left_w:
                 name = name[:left_w-3] + "..."
-                
+
             attrs = curses.A_NORMAL
             if idx == self.selected_chat_index:
                 attrs |= curses.A_REVERSE
-                
+
             line = name.ljust(left_w)
             stdscr.addnstr(row_y, 0, line, left_w, attrs)
-            
+
         # Draw vertical separator line
-        for y in range(top, h - 1):
-            stdscr.addch(y, left_w + 1, curses.ACS_VLINE)
+        if left_w + 1 < w:
+            for y in range(top, h - 1):
+                try:
+                    stdscr.addch(y, left_w + 1, curses.ACS_VLINE)
+                except curses.error:
+                    pass
             
         # --- Draw Right Column: Active Conversation Messages ---
         with self.data_lock:
@@ -1598,7 +1625,6 @@ class MeshTopApp:
             ts = rec.get("ts_iso")
             # convert ts to epoch if present
             try:
-                import datetime
                 from datetime import datetime as _dt
                 # Attempt parsing ISO
                 if isinstance(ts, str):
@@ -1632,14 +1658,15 @@ class MeshTopApp:
             base_dir = Path(__file__).resolve().parent
         except Exception:
             base_dir = Path(".").resolve()
-            
+
         file_path = base_dir / "traced_stations.json"
-        
+        tmp_path = base_dir / "traced_stations.json.tmp"
+
         data_to_save = {
             "saved_at": time.time(),
             "traces": {}
         }
-        
+
         with self.data_lock:
             for num, node in self.nodes.items():
                 if getattr(node, "last_route_time", None) is not None and node.last_route_time > 0:
@@ -1649,12 +1676,17 @@ class MeshTopApp:
                         "last_route_snr_back": node.last_route_snr_back,
                         "last_route_time": node.last_route_time
                     }
-                    
+
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, indent=4)
+            tmp_path.replace(file_path)
         except Exception:
-            pass
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     def _load_traced_stations(self):
         """
@@ -1843,10 +1875,13 @@ class MeshTopApp:
         }
         
         try:
-            filepath = "/home/pinkfloyd/Mesh_kot/traces.jsonl"
-            import json
-            with open(filepath, "a") as f:
-                f.write(json.dumps(record) + "\n")
+            try:
+                base_dir = Path(__file__).resolve().parent
+            except Exception:
+                base_dir = Path(".").resolve()
+            filepath = base_dir / "traces.jsonl"
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception:
             pass
 
@@ -1961,7 +1996,11 @@ class MeshTopApp:
                 continue
             path = list(n.last_route) + [n.num]
             curr = tree
+            seen_steps = set()
             for idx, step in enumerate(path):
+                if step is None or step == self.local_num or step in seen_steps:
+                    continue
+                seen_steps.add(step)
                 if step not in curr:
                     curr[step] = {"children": {}, "is_target": False, "snr": None}
                 if idx == len(path) - 1:
@@ -1971,10 +2010,18 @@ class MeshTopApp:
                         curr[step]["snr"] = snrs[-1] / 4.0
                 curr = curr[step]["children"]
 
-        def get_subtree_size(node_data):
-            return 1 + sum(get_subtree_size(v) for v in node_data["children"].values())
+        def get_subtree_size(node_data, visited=None):
+            if visited is None:
+                visited = set()
+            nid = id(node_data)
+            if nid in visited:
+                return 1
+            visited.add(nid)
+            return 1 + sum(get_subtree_size(v, visited) for v in node_data["children"].values())
 
-        def format_tree(curr_tree, prefix=""):
+        def format_tree(curr_tree, prefix="", visited=None):
+            if visited is None:
+                visited = set()
             lines = []
             sorted_children = sorted(
                 curr_tree.items(),
@@ -1982,22 +2029,26 @@ class MeshTopApp:
                 reverse=True
             )
             for idx, (num, data) in enumerate(sorted_children):
+                if num in visited:
+                    continue
+                visited_next = set(visited)
+                visited_next.add(num)
                 child_is_last = (idx == len(sorted_children) - 1)
                 marker = "└── " if child_is_last else "├── "
-                
+
                 with self.data_lock:
                     n = self.nodes.get(num)
                 if n:
                     name = n.short_name or n.node_id or f"#{num}"
                 else:
                     name = f"#{num}"
-                    
+
                 snr_val = data["snr"]
                 snr_str = f" ({snr_val:+.1f}dB)" if snr_val is not None else ""
                 lines.append(f"{prefix}{marker}{name}{snr_str}")
-                
+
                 next_prefix = prefix + ("    " if child_is_last else "│   ")
-                lines.extend(format_tree(data["children"], next_prefix))
+                lines.extend(format_tree(data["children"], next_prefix, visited_next))
             return lines
 
         if not tree:
@@ -2018,56 +2069,61 @@ class MeshTopApp:
         # Render tree dynamically depending on width
         if w >= 80:
             for y in range(2, h - 2):
-                stdscr.addch(y, 42, curses.ACS_VLINE)
-                
+                try:
+                    stdscr.addch(y, 42, curses.ACS_VLINE)
+                except curses.error:
+                    pass
+
             stdscr.attron(curses.A_BOLD | curses.color_pair(3))
-            stdscr.addnstr(2, 44, "■ NETWORK CONNECTIONS MAP", w - 46)
+            stdscr.addnstr(2, 44, "■ NETWORK CONNECTIONS MAP", max(1, w - 46))
             stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
-            
-            max_tree_height = h - 4 - 2
+
+            max_tree_height = max(1, h - 4 - 2)
             col_width = 35
             w_avail = w - 44
             num_cols = max(1, w_avail // col_width)
-            
+
             for col_idx in range(num_cols):
                 col_x = 44 + col_idx * col_width
                 start = col_idx * max_tree_height
                 end = (col_idx + 1) * max_tree_height
                 col_lines = visible_lines[start:end]
-                
+
                 for idx, line in enumerate(col_lines):
-                    stdscr.addnstr(4 + idx, col_x, line, col_width - 3)
-                    
+                    if 4 + idx < h - 1:
+                        stdscr.addnstr(4 + idx, col_x, line, col_width - 3)
+
             total_slots = num_cols * max_tree_height
-            if len(visible_lines) > total_slots:
+            if len(visible_lines) > total_slots and h > 3:
                 last_col_x = 44 + (num_cols - 1) * col_width
                 stdscr.addnstr(h - 3, last_col_x, "[...↓ more]", col_width - 3, curses.color_pair(3) | curses.A_REVERSE)
         else:
             if h - row >= 6:
                 row += 1
                 stdscr.attron(curses.A_BOLD | curses.color_pair(3))
-                stdscr.addnstr(row, 2, "■ NETWORK CONNECTIONS MAP", maxw - 4)
+                stdscr.addnstr(row, 2, "■ NETWORK CONNECTIONS MAP", max(1, maxw - 4))
                 stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
                 row += 1
-                
-                max_tree_height = h - row - 2
+
+                max_tree_height = max(1, h - row - 2)
                 col_width = 35
                 num_cols = max(1, w // col_width)
-                
+
                 for col_idx in range(num_cols):
                     col_x = 4 + col_idx * col_width
                     start = col_idx * max_tree_height
                     end = (col_idx + 1) * max_tree_height
                     col_lines = visible_lines[start:end]
-                    
+
                     for idx, line in enumerate(col_lines):
-                        stdscr.addnstr(row + idx, col_x, line, col_width - 3)
-                        
+                        if row + idx < h - 1:
+                            stdscr.addnstr(row + idx, col_x, line, col_width - 3)
+
                 total_slots = num_cols * max_tree_height
-                if len(visible_lines) > total_slots:
+                if len(visible_lines) > total_slots and (row + max_tree_height - 1 < h - 1):
                     last_col_x = 4 + (num_cols - 1) * col_width
                     stdscr.addnstr(row + max_tree_height - 1, last_col_x, "[...↓ more]", col_width - 3, curses.color_pair(3) | curses.A_REVERSE)
-            
+
         footer = "[n] nodes  [m] messages  [s] stats  [↑/↓] scroll tree  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
@@ -2076,41 +2132,48 @@ class MeshTopApp:
         # This includes itself (if direct/connected) and any other nodes that use it as a relay/hop.
         if node_num == self.local_num:
             return False
-        
+
         connected_nodes = set()
-        
-        # 1. If we have a route to this node, it is connected to us.
-        node = self.nodes.get(node_num)
-        if node and getattr(node, "last_route", None) is not None:
-            connected_nodes.add(node_num)
-            
-        # 2. Add all other nodes that have this node in their path
-        for num, n in self.nodes.items():
-            if num == self.local_num or num == node_num:
-                continue
-            route = getattr(n, "last_route", None)
-            if route and node_num in route:
-                connected_nodes.add(num)
-                
+
+        with self.data_lock:
+            # 1. If we have a route to this node, it is connected to us.
+            node = self.nodes.get(node_num)
+            if node and getattr(node, "last_route", None) is not None:
+                connected_nodes.add(node_num)
+
+            # 2. Add all other nodes that have this node in their path
+            for num, n in self.nodes.items():
+                if num == self.local_num or num == node_num:
+                    continue
+                route = getattr(n, "last_route", None)
+                if route and node_num in route:
+                    connected_nodes.add(num)
+
         return len(connected_nodes) >= 2
 
     def _mermaid_node_id(self, node_num):
-        if node_num == self.local_num:
+        if node_num is not None and node_num == self.local_num:
             return "ME"
-        n = self.nodes.get(node_num)
+        if node_num is None:
+            return "ME"
+        with self.data_lock:
+            n = self.nodes.get(node_num)
         if n and n.node_id:
             return n.node_id.replace("!", "N")
         return f"Node_{node_num}"
 
     def node_definition(self, node_num):
         node_id = self._mermaid_node_id(node_num)
-        if node_num == self.local_num:
+        if node_num is not None and node_num == self.local_num:
             return 'ME["ME (Local Node)"]'
-        n = self.nodes.get(node_num)
+        if node_num is None:
+            return 'ME["ME (Local Node)"]'
+        with self.data_lock:
+            n = self.nodes.get(node_num)
         if n:
-            label = f"{n.short_name or n.node_id or f'#{n.num}'}"
+            label = (n.short_name or n.node_id or f"#{n.num}").replace('"', "'")
             if n.long_name:
-                label += f" ({n.long_name})"
+                label += f" ({n.long_name.replace('\"', '\'')})"
             return f'{node_id}["{label}"]'
         else:
             return f'{node_id}["#{node_num}"]'
@@ -2118,74 +2181,79 @@ class MeshTopApp:
     def _export_topology(self):
         with self.data_lock:
             nodes_list = list(self.nodes.values())
-        
+
         node_defs = set()
         edges = set()
-        
+
         # Add local node
         node_defs.add(self.node_definition(self.local_num))
-        
+
         for node in nodes_list:
             if node.is_me:
                 continue
-            
+
             route = getattr(node, "last_route", None)
             if route is not None:
                 # Add definition for target node
                 node_defs.add(self.node_definition(node.num))
-                
+
                 # Build hop path: ME -> Hop1 -> Hop2 -> ... -> Target
-                path = [self.local_num] + list(route) + [node.num]
-                
+                path = [self.local_num if self.local_num is not None else 0] + [h for h in route if h is not None] + [node.num]
+
                 # Add definitions for all intermediate hops
                 for num in route:
-                    node_defs.add(self.node_definition(num))
-                    
+                    if num is not None:
+                        node_defs.add(self.node_definition(num))
+
                 # Add edges
                 for i in range(len(path) - 1):
                     id_from = self._mermaid_node_id(path[i])
                     id_to = self._mermaid_node_id(path[i+1])
-                    
+
                     # If it's the last hop, we can add SNR details if available
                     label = ""
                     if i == len(path) - 2:
                         snrs = getattr(node, "last_route_snr_towards", []) or []
                         if snrs and snrs[-1] is not None and snrs[-1] != -128:
                             label = f"{snrs[-1]/4.0:+.1f}dB"
-                    
+
                     edges.add((id_from, id_to, label))
-                    
+
         # Generate content
         lines = []
         lines.append("# Meshtastic Network Topology")
         lines.append(f"Generated at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         lines.append("```mermaid")
         lines.append("graph TD")
-        
+
         # Node definitions
         for d in sorted(node_defs):
             lines.append(f"  {d}")
         lines.append("")
-        
+
         # Edges
         for n_from, n_to, label in sorted(edges):
             if label:
                 lines.append(f"  {n_from} -->|{label}| {n_to}")
             else:
                 lines.append(f"  {n_from} --> {n_to}")
-                
+
         # Highlight local node in green
         lines.append("  style ME fill:#2e7d32,stroke:#1b5e20,stroke-width:3px,color:#fff")
-        
+
         lines.append("```")
         content = "\n".join(lines)
-        
+
         # Write to file
-        filepath = "/home/pinkfloyd/Mesh_kot/topology.md"
         try:
-            with open(filepath, "w") as f:
+            try:
+                base_dir = Path(__file__).resolve().parent
+            except Exception:
+                base_dir = Path(".").resolve()
+            filepath = base_dir / "topology.md"
+            with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
-            
+
             notification = MessageInfo(
                 timestamp=time.time(),
                 direction="IN",
@@ -2193,11 +2261,11 @@ class MeshTopApp:
                 from_short="SYS",
                 to_id="ME",
                 to_short="ME",
-                text=f"Network topology exported to topology.md",
+                text="Network topology exported to topology.md",
                 portnum="TEXT_MESSAGE_APP",
                 status="RECEIVED"
             )
-            
+
             with self.data_lock:
                 self.messages.append(notification)
         except Exception:
@@ -2369,11 +2437,24 @@ class MeshTopApp:
                 time.sleep(1)
 
     def run(self):
-        self.connect()
-        # Start auto-trace daemon thread
-        self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True)
-        self.auto_trace_thread.start()
-        curses.wrapper(self.run_curses)
+        try:
+            self.connect()
+            # Start auto-trace daemon thread
+            self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True)
+            self.auto_trace_thread.start()
+            curses.wrapper(self.run_curses)
+        finally:
+            self.running = False
+            if getattr(self, "archiver", None):
+                try:
+                    self.archiver.close()
+                except Exception:
+                    pass
+            if self.iface:
+                try:
+                    self.iface.close()
+                except Exception:
+                    pass
 
 
 def get_local_subnet():
@@ -2399,12 +2480,10 @@ def get_local_subnet():
 def check_ip(ip, port=4403, timeout=0.8):
     import socket
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((ip, port))
-        sock.close()
-        if result == 0:
-            return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            if sock.connect_ex((ip, port)) == 0:
+                return ip
     except Exception:
         pass
     return None
