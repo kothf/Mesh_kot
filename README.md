@@ -69,9 +69,19 @@ Inside the dashboard:
 * **`m` / `M`**: Switch to **Messages / Conversations** view.
 * **`s` / `S`**: Switch to the **Stats Dashboard** view.
 * **`t` / `T`**: Switch to **Signal Trace** view (or retry/run a manual trace on the selected node).
-* **`p` / `P`**: Export the live network topology map to `topology.md` (usable from Nodes or Stats view).
+* **`p` / `P`**: Export the live network topology map to `topology.md` (from any view).
 * **`g` / `G`**: Toggle message filtering (ON/OFF) to hide system messages/gibberish.
 * **`q` / `Q`**: Quit the application safely.
+* **`↑/↓`, `PgUp/PgDn`, `Home/End`**: Move the selection (it stays on the same node when the list re-sorts).
+
+Shortcuts also work on a Russian or Hebrew keyboard layout (same physical keys). Messages can be typed in any language; the prompt shows the UTF-8 byte count against the 200-byte limit (`Ctrl-U` clears the line).
+
+---
+
+## 🔌 Connection & Logging
+
+* If the radio reboots or WiFi drops, the header shows `[RECONNECTING]` and the app reconnects by itself with backoff (TCP keepalive detects dead links within about a minute).
+* Library messages, tracebacks and UI errors go to `meshtop.log` next to the script instead of over the screen. A drawing error is shown in the header and logged; it no longer closes the app.
 
 ---
 
@@ -80,4 +90,4 @@ Inside the dashboard:
 The repository is configured to exclude local runtime logs and databases via `.gitignore`:
 * `traces.jsonl`: Local database of all successful traceroute histories.
 * `topology.md`: Generated Mermaid graphs from your `P` export keypresses.
-* `*.log` & `__pycache__/`: Python cache and application execution logs.
+* `*.log` & `__pycache__/`: Python cache and application execution logs (`meshtop.log`).

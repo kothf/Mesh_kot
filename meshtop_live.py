@@ -5,11 +5,14 @@ import math
 import time
 import threading
 import json
-from meshtastic import mesh_pb2
-from google.protobuf.json_format import MessageToDict
+import socket
+import sys
+import traceback
+from meshtastic.protobuf import mesh_pb2, portnums_pb2
 import logging
 logging.getLogger("meshtastic").setLevel(logging.WARNING)
 logging.getLogger("pubsub").setLevel(logging.WARNING)
+log = logging.getLogger("meshtop")
 import re
 import unicodedata
 
@@ -58,6 +61,7 @@ class NodeInfo:
     last_route: Optional[List[int]] = None
     last_route_snr_towards: Optional[List[int]] = None
     last_route_snr_back: Optional[List[int]] = None
+    last_route_back: Optional[List[int]] = None
     last_route_time: Optional[float] = None
 
     _app_instance = None
@@ -238,18 +242,136 @@ def haversine_km(lat1, lon1, lat2, lon2) -> Optional[float]:
 
 
 def safe_text(s: str) -> str:
-    """Remove NULL and non-printable chars so curses won't explode."""
+    """Remove control chars so curses won't explode (tabs become spaces)."""
     if not s:
         return ""
     out_chars = []
-    for ch in s:
-        # drop NULL & other nasty control chars
-        if ord(ch) < 32 and ch not in ("\t", " "):
+    for ch in str(s):
+        if ch == "\t":
+            out_chars.append(" ")
+        elif unicodedata.category(ch) == "Cc":
             continue
-        if ch == "\x00":
-            continue
-        out_chars.append(ch)
+        else:
+            out_chars.append(ch)
     return "".join(out_chars)
+
+
+def _cell_width(ch: str) -> int:
+    """Terminal cells taken by one character (emoji/CJK are 2, combining marks 0)."""
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def text_width(s: str) -> int:
+    return sum(_cell_width(ch) for ch in s)
+
+
+def clip_cells(s: str, max_cells: int) -> str:
+    """Cut s so it takes at most max_cells terminal cells."""
+    out, used = [], 0
+    for ch in s:
+        cw = _cell_width(ch)
+        if used + cw > max_cells:
+            break
+        out.append(ch)
+        used += cw
+    return "".join(out)
+
+
+def ljust_cells(s: str, width: int) -> str:
+    """Like str.ljust, but by terminal cells, and clipping overlong text."""
+    s = clip_cells(s, width)
+    return s + " " * max(0, width - text_width(s))
+
+
+def wrap_cells(s: str, width: int) -> List[str]:
+    """Word-wrap s into lines of at most width cells."""
+    width = max(1, width)
+    lines: List[str] = []
+    line, used = "", 0
+    for word in re.split(r"(\s+)", s):
+        if not word:
+            continue
+        ww = text_width(word)
+        if used + ww <= width:
+            line += word
+            used += ww
+            continue
+        if line.strip():
+            lines.append(line.rstrip())
+        line, used = "", 0
+        if word.isspace():
+            continue
+        while text_width(word) > width:  # hard-split words longer than a line
+            part = clip_cells(word, width) or word[0]
+            lines.append(part)
+            word = word[len(part):]
+        line, used = word, text_width(word)
+    if line.strip() or not lines:
+        lines.append(line.rstrip())
+    return lines
+
+
+class SafeWin:
+    """
+    Proxy around the curses screen that clips every write to the visible area
+    (measured in terminal cells) and swallows curses.error. Writing past the
+    bottom of a short terminal used to raise and kill the whole app.
+    """
+
+    def __init__(self, win):
+        self._win = win
+
+    def __getattr__(self, name):
+        return getattr(self._win, name)
+
+    def addnstr(self, y, x, s, n, attr=0):
+        h, w = self._win.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w or n <= 0:
+            return
+        s = clip_cells(safe_text(s), min(n, w - x))
+        if not s:
+            return
+        try:
+            self._win.addstr(y, x, s, attr)
+        except curses.error:
+            pass  # e.g. writing the bottom-right cell; the text is drawn anyway
+
+    def addstr(self, y, x, s, attr=0):
+        self.addnstr(y, x, s, 1 << 30, attr)
+
+    def addch(self, y, x, ch, attr=0):
+        h, w = self._win.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            try:
+                self._win.addch(y, x, ch, attr)
+            except curses.error:
+                pass
+
+    def move(self, y, x):
+        h, w = self._win.getmaxyx()
+        try:
+            self._win.move(max(0, min(y, h - 1)), max(0, min(x, w - 1)))
+        except curses.error:
+            pass
+
+
+# Command keys typed on a Russian or Hebrew layout map to the Latin key at the
+# same physical position, so shortcuts work without switching layouts.
+_LAYOUT_TO_LATIN = {}
+for _lat, _ru, _he in zip("qwertyuiopasdfghjklzxcvbnm",
+                          "йцукенгшщзфывапролдячсмить",
+                          "  קראטוןםפשדגכעיחלךזסבהנמצ"):
+    _LAYOUT_TO_LATIN[_ru] = _lat
+    _LAYOUT_TO_LATIN[_ru.upper()] = _lat.upper()
+    if _he != " ":
+        _LAYOUT_TO_LATIN[_he] = _lat
+
+# Meshtastic text payload limit (bytes of UTF-8), leaving room for encryption overhead
+MAX_TEXT_BYTES = 200
+UNKNOWN_HOP = 0xFFFFFFFF  # firmware puts this in a route for relays it could not identify
+
 
 def _norm(x) -> str:
     """Normalize Meshtastic IDs: strip '!' / '#' and ensure string."""
@@ -265,6 +387,16 @@ def _msg_involves_node(msg: MessageInfo, node: NodeInfo, local_id: Optional[str]
 
 
 
+def _ints(v) -> List[int]:
+    res = []
+    for x in v or []:
+        try:
+            res.append(int(x))
+        except (ValueError, TypeError):
+            pass
+    return res
+
+
 # ---------- Main app ----------
 
 class MeshTopApp:
@@ -278,106 +410,177 @@ class MeshTopApp:
 
     def _handle_trace_keys(self, ch):
         if ch in (ord('t'), ord('T')):
-            if time.time() < self.trace_cooldown_end or self._trace_active():
-                with self.trace_lock:
-                    remain = max(0, int(self.trace_cooldown_end - time.time()))
-                    self.trace_result = self.trace_result or {}
-                    self.trace_result["error"] = f"TRACE busy (wait {remain}s)"
-                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
-                return
             self._send_trace_to_current()
 
-    def _do_traceroute(self, dest, hop_limit=7, channel_index=0):
-        """
-        Runs in a background thread so the curses UI never blocks.
-        """
+    # ---------- Traceroute plumbing ----------
+    #
+    # Only one traceroute is in flight at a time (manual or auto), tracked in
+    # self.trace_inflight. Each request registers its own response callback with
+    # the meshtastic library, keyed by packet id, so a reply (or a NO_RESPONSE
+    # routing error) is always attributed to the node it was actually sent to.
+
+    def _send_traceroute(self, dest_num: int, kind: str) -> dict:
+        """Send a traceroute to dest_num; returns the in-flight record. Raises on send failure."""
+        iface = self.iface
+        if iface is None:
+            raise RuntimeError("not connected")
+        inflight = {
+            "dest_num": dest_num,
+            "kind": kind,  # "manual" or "auto"
+            "started": time.time(),
+            "deadline": time.time() + self.trace_timeout_sec,
+            "done": threading.Event(),
+            "ok": False,
+            "req_id": None,
+        }
+
+        def on_trace_response(p, inflight=inflight):
+            self._on_trace_response(p, inflight)
+
+        if not iface.isConnected.is_set():
+            raise RuntimeError("not connected")  # sendData would block the caller for minutes
+        with self.trace_lock:
+            if self.trace_inflight is not None:
+                raise RuntimeError("another traceroute is in flight")
+            self.trace_inflight = inflight
         try:
-            if self.iface:
-                from meshtastic.protobuf import mesh_pb2, portnums_pb2
-                r = mesh_pb2.RouteDiscovery()
-                self.iface.sendData(
-                    r,
-                    destinationId=dest,
-                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
-                    wantResponse=True,
-                    onResponse=self.iface.onResponseTraceRoute,
-                    channelIndex=channel_index,
-                    hopLimit=hop_limit
-                )
-                # Wait up to 30 seconds for manual trace timeout
-                for _ in range(300):
-                    if not self.running:
-                        break
-                    if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
-                        break
-                    time.sleep(0.1)
-        except Exception as e:
+            pkt = iface.sendData(
+                mesh_pb2.RouteDiscovery(),
+                destinationId=dest_num,
+                portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
+                wantResponse=True,
+                onResponse=on_trace_response,
+                channelIndex=0,
+                hopLimit=7,
+            )
+            inflight["req_id"] = getattr(pkt, "id", None)
+        except BaseException:  # the library may sys.exit() on bad input; never let it kill the UI
             with self.trace_lock:
-                if self.trace_result is not None:
-                    self.trace_result["error"] = f"TRACE SEND ERROR: {e}"
-                    self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
+                if self.trace_inflight is inflight:
+                    self.trace_inflight = None
+            raise
+        return inflight
+
+    def _finish_trace(self, inflight: dict, ok: bool):
+        inflight["ok"] = ok
+        inflight["done"].set()
+        with self.trace_lock:
+            if self.trace_inflight is inflight:
+                self.trace_inflight = None
+        iface = self.iface
+        if inflight.get("req_id") is not None and iface is not None:
+            try:  # drop the library's handler for a request we gave up on
+                iface.responseHandlers.pop(inflight["req_id"], None)
+            except Exception:
+                pass
+
+    def _on_trace_response(self, packet: dict, inflight: dict):
+        """Called by the meshtastic reader thread with the reply to one of our traceroutes."""
+        d = packet.get("decoded") or {}
+        dest_num = inflight["dest_num"]
+        is_manual_view = inflight["kind"] == "manual" or self.trace_target_num == dest_num
+        if d.get("requestId") is not None:
+            with self.trace_lock:
+                self._handled_trace_ids.add(d["requestId"])
+
+        rd = d.get("traceroute")
+        if isinstance(rd, dict):
+            route = _ints(rd.get("route"))
+            snr_towards = _ints(rd.get("snrTowards"))
+            route_back = _ints(rd.get("routeBack"))
+            snr_back = _ints(rd.get("snrBack"))
+            self._record_route(dest_num, route, snr_towards, route_back, snr_back)
+            if is_manual_view:
+                with self.trace_lock:
+                    self.trace_result = {
+                        "dest_num": dest_num,
+                        "route": route,
+                        "snr_towards": snr_towards,
+                        "route_back": route_back,
+                        "snr_back": snr_back,
+                        "ts": inflight["started"],
+                        "error": None,
+                        "elapsed": time.time() - inflight["started"],
+                    }
+            self._finish_trace(inflight, ok=True)
+            return
+
+        reason = ((d.get("routing") or {}).get("errorReason")) or "unexpected reply"
+        if is_manual_view and inflight["kind"] == "manual":
+            self._set_trace_error(f"{reason} (no traceroute reply)", inflight["started"])
+        self._finish_trace(inflight, ok=False)
+
+    def _record_route(self, dest_num, route, snr_towards, route_back, snr_back):
+        node = self._get_or_create_node(dest_num)
+        node.last_route = route
+        node.last_route_snr_towards = snr_towards
+        node.last_route_back = route_back
+        node.last_route_snr_back = snr_back
+        node.last_route_time = time.time()
+        self._log_trace_history(dest_num, route, snr_towards, snr_back, route_back)
+        self._save_traced_stations()
+
+    def _set_trace_error(self, msg: str, started: Optional[float] = None):
+        with self.trace_lock:
+            self.trace_result = dict(self.trace_result or {})
+            self.trace_result["error"] = msg
+            self.trace_result["elapsed"] = time.time() - (started or time.time())
 
     def _trace_active(self) -> bool:
-        """True while we're waiting for a result and haven't timed out yet."""
+        """True while any traceroute (manual or auto) is waiting for its reply."""
         with self.trace_lock:
-            tr = self.trace_result or {}
-            if tr.get("error"):
-                return False
-            ts = tr.get("ts")
-            route = tr.get("route") or []
-        return bool(ts) and not route and time.time() < self.trace_deadline
+            return self.trace_inflight is not None
+
+    def _check_trace_timeout(self):
+        """Expire the in-flight traceroute once its deadline passes (called from the UI loop)."""
+        with self.trace_lock:
+            inflight = self.trace_inflight
+        if inflight is None or time.time() < inflight["deadline"]:
+            return
+        if inflight["kind"] == "manual":
+            self._set_trace_error("Timeout (no response)", inflight["started"])
+        self._finish_trace(inflight, ok=False)
 
     def _send_trace_to_current(self):
-        # record start time for timeout logic
-        self.trace_started_at = time.time()
-
         if self.trace_target_num is None:
             return
         target = self.nodes.get(self.trace_target_num)
         if not target:
             return
-
         now = time.time()
 
-        # Prevent manual trace if background auto-trace is actively running
-        if getattr(self, "auto_trace_in_progress", False) and getattr(self, "auto_trace_active_node", None) is not None:
-            with self.trace_lock:
-                self.trace_result = self.trace_result or {}
-                self.trace_result["error"] = "TRACE suppressed (auto-trace active)"
-                self.trace_result["elapsed"] = 0.0
+        with self.trace_lock:
+            inflight = self.trace_inflight
+        if inflight is not None:
+            who = self._node_label(inflight["dest_num"])
+            if inflight["kind"] == "auto":
+                self._set_trace_error(f"TRACE busy: auto-trace to {who} in flight, try again shortly")
+            elif inflight["dest_num"] != target.num:
+                self._set_trace_error(f"TRACE busy: still waiting for {who}")
+            return  # a manual trace to this node is already running; keep waiting
+        if now < self.trace_cooldown_end:
+            self._set_trace_error(f"TRACE cooldown ({self.trace_cooldown_end - now:.0f}s)")
             return
 
-        # Respect cooldown or an active in-flight attempt
-        if now < self.trace_cooldown_end or self._trace_active():
-            with self.trace_lock:
-                remain = max(0, int(self.trace_cooldown_end - now))
-                self.trace_result = self.trace_result or {}
-                self.trace_result["error"] = f"TRACE suppressed (cooldown {remain}s)"
-                self.trace_result["elapsed"] = now - (self.trace_started_at or now)
-            return
-
-        # seed UI state
         with self.trace_lock:
             self.trace_result = {
                 "dest_num": target.num,
                 "route": [],
                 "snr_towards": [],
+                "route_back": [],
                 "snr_back": [],
                 "ts": now,
                 "error": None,
                 "elapsed": None,
             }
-
-        # set timeout and cooldown windows
-        self.trace_deadline = now + self.trace_timeout_sec
+        self.trace_started_at = now
         self.trace_cooldown_end = now + self.trace_cooldown_sec
-
-        dest = target.node_id or target.num  # prefer node_id
-        # launch background worker
-        self.trace_thread = threading.Thread(
-            target=self._do_traceroute, args=(dest, 7, 0), daemon=True
-        )
-        self.trace_thread.start()
+        try:
+            self._send_traceroute(target.num, "manual")
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            self._set_trace_error(f"TRACE SEND ERROR: {e}", now)
 
     def trigger_trace_to_node(self, node_num: int, switch_view: bool = True):
         self.trace_target_num = node_num
@@ -385,6 +588,22 @@ class MeshTopApp:
             self.view_mode = "TRACE"
             self._need_full_clear = True
         self._send_trace_to_current()
+
+    def _node_label(self, num, prefer_long: bool = False) -> str:
+        """Human name for a node number ('?' for the firmware's unknown-relay placeholder)."""
+        if num is None:
+            return "?"
+        if num == UNKNOWN_HOP:
+            return "?"
+        if self.local_num is not None and num == self.local_num:
+            return (self.local_long if prefer_long else self.local_short) or "ME"
+        n = self.nodes.get(num)
+        if n:
+            names = (n.long_name, n.short_name) if prefer_long else (n.short_name, n.long_name)
+            for name in names + (n.node_id,):
+                if name and name != "?":
+                    return name
+        return f"#{num}"
 
     def __init__(self, host: str, port: int = 4403):
         NodeInfo._app_instance = self
@@ -444,36 +663,145 @@ class MeshTopApp:
         self.data_lock = threading.RLock()
 
         # ---- add these ----
-        self.trace_deadline = 0.0
         self.trace_cooldown_end = 0.0
         self._need_full_clear = False
         self.auto_trace_active_node = None
         self.auto_trace_in_progress = False
+        self.trace_inflight: Optional[dict] = None
+        self._handled_trace_ids: set = set()
+
+        # selection is tracked by node number so it doesn't jump when lists re-sort
+        self.selected_node_num: Optional[int] = None
+        self.selected_chat_num: Optional[int] = None
+
+        # connection supervision
+        self.conn_state = "CONNECTING"
+        self.conn_error = ""
+        self.ui_error = ""
+        self._subscribed = False
+        self._keepalive_sock = None
 
     # ---------- Connection and initial load ----------
 
     def connect(self):
-        self.iface = TCPInterface(self.host, portNumber=self.port)
+        self.iface = self._open_interface()
+        self._load_nodedb(self.iface)
+        self._load_traced_stations()
+        if not self._subscribed:
+            # subscribe for live updates (once; callbacks survive reconnects)
+            pub.subscribe(self.on_packet, "meshtastic.receive")
+            pub.subscribe(self.on_telemetry, "meshtastic.receive.telemetry")
+            pub.subscribe(self.on_position, "meshtastic.receive.position")
+            pub.subscribe(self.on_user, "meshtastic.receive.user")
+            pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
+            self._subscribed = True
+        self.conn_state = "CONNECTED"
 
-        # Suppress meshtastic library print output from traceroutes by stubbing onResponseTraceRoute
-        if hasattr(self.iface, "onResponseTraceRoute"):
-            def silent_on_response(p):
-                if hasattr(self.iface, "_acknowledgment"):
-                    self.iface._acknowledgment.receivedTraceRoute = True
-            self.iface.onResponseTraceRoute = silent_on_response
+    def _open_interface(self) -> TCPInterface:
+        iface = TCPInterface(self.host, portNumber=self.port)
+        self._enable_keepalive(iface)
+        return iface
 
-        info = self.iface.myInfo
+    def _enable_keepalive(self, iface):
+        """
+        TCP keepalive turns a silently dead WiFi link into a socket error within
+        about a minute; otherwise recv() blocks forever and the screen just freezes.
+        """
+        sock = getattr(iface, "socket", None)
+        if sock is None or sock is self._keepalive_sock:
+            return
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt, val in (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+                if hasattr(socket, opt):
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+            self._keepalive_sock = sock
+        except OSError:
+            pass
+
+    def on_connection_lost(self, interface=None):
+        if interface is not None and interface is not self.iface:
+            return
+        self.conn_state = "LOST"
+        log.warning("connection to %s lost", self.host)
+
+    def _iface_alive(self, iface) -> bool:
+        rx = getattr(iface, "_rxThread", None)
+        # socket may be None for a moment while the library reconnects by itself
+        return rx is not None and rx.is_alive()
+
+    def _connection_supervisor(self):
+        """
+        The meshtastic reader thread dies for good on socket errors (device reboot,
+        WiFi drop) and only retries once on a clean close. Watch it and rebuild
+        the interface with backoff so the app keeps running instead of going stale.
+        """
+        delay = 5
+        while self.running:
+            for _ in range(20):
+                if not self.running:
+                    return
+                time.sleep(0.1)
+            iface = self.iface
+            if iface is not None and self._iface_alive(iface):
+                self._enable_keepalive(iface)  # the library may have re-created the socket
+                if self.conn_state != "CONNECTED":
+                    self.conn_state = "CONNECTED"
+                delay = 5
+                continue
+
+            self.conn_state = "RECONNECTING"
+            self.iface = None
+            with self.trace_lock:
+                inflight = self.trace_inflight
+            if inflight is not None:
+                if inflight["kind"] == "manual":
+                    self._set_trace_error("Connection lost", inflight["started"])
+                self._finish_trace(inflight, ok=False)
+            if iface is not None:
+                threading.Thread(target=self._close_quietly, args=(iface,), daemon=True).start()
+            try:
+                new = self._open_interface()
+            except Exception as e:
+                self.conn_error = str(e) or e.__class__.__name__
+                log.warning("reconnect to %s failed: %s (retry in %ss)", self.host, self.conn_error, delay)
+                for _ in range(delay * 10):
+                    if not self.running:
+                        return
+                    time.sleep(0.1)
+                delay = min(delay * 2, 60)
+                continue
+            if not self.running:
+                self._close_quietly(new)
+                return
+            self.iface = new
+            self.conn_error = ""
+            self._load_nodedb(new)
+            self.conn_state = "CONNECTED"
+            log.info("reconnected to %s", self.host)
+            delay = 5
+
+    @staticmethod
+    def _close_quietly(iface):
+        try:
+            iface.close()
+        except BaseException:
+            pass
+
+    def _load_nodedb(self, iface):
+        info = iface.myInfo
         if info:
             # try both attribute and dict styles
             self.local_num = getattr(info, "my_node_num", None) \
-                             or (isinstance(info, dict) and info.get("my_node_num"))
+                             or (isinstance(info, dict) and info.get("my_node_num")) or self.local_num
             self.local_id = getattr(info, "my_node_id", None) \
                             or getattr(info, "myNodeId", None) \
-                            or (isinstance(info, dict) and (info.get("my_node_id") or info.get("myNodeId")))
+                            or (isinstance(info, dict) and (info.get("my_node_id") or info.get("myNodeId"))) \
+                            or self.local_id
 
         # Pre-load nodeDB so we have names immediately
-        for num, n in self.iface.nodesByNum.items():
-            node = NodeInfo(num=num)
+        for num, n in list((iface.nodesByNum or {}).items()):
+            node = self._get_or_create_node(num)
 
             # n may be protobuf or dict
             u = getattr(n, "user", None)
@@ -553,8 +881,6 @@ class MeshTopApp:
                 self.local_lat = node.lat
                 self.local_lon = node.lon
 
-            self.nodes[num] = node
-
         # if my node wasn't present, synthesize it
         if self.local_num is not None and self.local_num not in self.nodes:
             n = NodeInfo(num=self.local_num, is_me=True)
@@ -563,16 +889,10 @@ class MeshTopApp:
             n.long_name = self.local_long
             n.lat = self.local_lat
             n.lon = self.local_lon
-            self.nodes[self.local_num] = n
+            with self.data_lock:
+                self.nodes[self.local_num] = n
 
         self._update_all_distances()
-        self._load_traced_stations()
-
-        # subscribe for live updates
-        pub.subscribe(self.on_packet, "meshtastic.receive")
-        pub.subscribe(self.on_telemetry, "meshtastic.receive.telemetry")
-        pub.subscribe(self.on_position, "meshtastic.receive.position")
-        pub.subscribe(self.on_user, "meshtastic.receive.user")
 
     # ---------- Node helpers ----------
 
@@ -613,8 +933,6 @@ class MeshTopApp:
         node.short_name = u.get("shortName", node.short_name)
         node.long_name = u.get("longName", node.long_name)
         node.hw_model = u.get("hwModel", node.hw_model)
-        node.last_seen = time.time()
-        node.seen_packets += 1
 
         if self.local_num is not None and num == self.local_num:
             if not self.local_id and "id" in u:
@@ -632,9 +950,6 @@ class MeshTopApp:
         dev = t.get("deviceMetrics", {})
         env = t.get("environmentMetrics", {})
 
-        node.last_seen = time.time()
-        node.seen_packets += 1
-
         node.battery = dev.get("batteryLevel", node.battery)
         node.voltage = dev.get("voltage", node.voltage)
         node.channel_util = dev.get("channelUtilization", node.channel_util)
@@ -643,11 +958,6 @@ class MeshTopApp:
 
         node.temperature = env.get("temperature", node.temperature)
         node.humidity = env.get("relativeHumidity", node.humidity)
-
-        node.hop_limit = packet.get("hopLimit", node.hop_limit)
-        node.hop_start = packet.get("hopStart", node.hop_start)
-        node.last_rssi = packet.get("rxRssi", node.last_rssi)
-        node.last_snr = packet.get("rxSnr", node.last_snr)
 
     def on_position(self, packet, interface):
         num = packet.get("from")
@@ -666,8 +976,6 @@ class MeshTopApp:
 
         node.lat = lat
         node.lon = lon
-        node.last_seen = time.time()
-        node.seen_packets += 1
         self._update_distance(node)
 
         if self.local_num is not None and num == self.local_num:
@@ -703,110 +1011,20 @@ class MeshTopApp:
         except Exception:
             pn_name = str(pn)
 
-        # ============================================================
-        # 1) HANDLE ROUTING/TRACEROUTE FIRST (populate self.trace_result)
-        # ============================================================
-
-        # Some firmwares send "NO_RESPONSE" via ROUTING_APP
-        if pn_name == "ROUTING_APP":
-            routing = d.get("routing", {})
-            if routing.get("errorReason") == "NO_RESPONSE":
-                with self.trace_lock:
-                    if self.trace_result and self.trace_result.get("dest_num") is not None:
-                        self.trace_result["error"] = "NO_RESPONSE"
-                self.trace_deadline = 0.0
-                self.trace_cooldown_end = time.time() + 0.5
-
-        # Traceroute / RouteDiscovery can arrive under several names or even as a raw int
-        looks_like_trace = pn_name in {
-            "TRACEROUTE_APP", "ROUTE_DISCOVERY_APP", "TRACE_ROUTE_APP", "ROUTE_TRACE_APP"
-        } or (isinstance(pn, int) and pn in (9, 48, 49, 70))  # 9/70 is TRACEROUTE_APP in current enums
-
-        if looks_like_trace:
-            try:
-                payload = d.get("payload")
-                rd_dict = None
-
-                # Case A: some builds include a decoded sub-dict in the message
-                for k in ("routeDiscovery", "traceroute", "route_tracer"):
-                    v = d.get(k)
-                    if isinstance(v, dict) and any(
-                            x in v for x in ("route", "snrTowards", "snrBack", "snr_forward", "snr_return")):
-                        rd_dict = v
-                        break
-
-                # Case B: decoded dict itself directly contains route fields
-                if rd_dict is None and any(x in d for x in ("route", "snrTowards", "snrBack", "snr_forward", "snr_return")):
-                    rd_dict = d
-
-                # Case C: payload is a protobuf RouteDiscovery
-                if rd_dict is None and isinstance(payload, (bytes, bytearray)):
-                    rd = mesh_pb2.RouteDiscovery()
-                    rd.ParseFromString(payload)
-                    rd_dict = MessageToDict(rd)
-
-                if rd_dict:
-                    def _ints(v):
-                        if not v:
-                            return []
-                        res = []
-                        for x in v:
-                            try:
-                                res.append(int(x))
-                            except (ValueError, TypeError):
-                                pass
-                        return res
-
-                    route = _ints(rd_dict.get("route"))
-                    snr_towards = _ints(rd_dict.get("snrTowards") or rd_dict.get("snr_forward"))
-                    snr_back = _ints(rd_dict.get("snrBack") or rd_dict.get("snr_return"))
-
-                    target_sender = packet.get("from")
-                    # In Meshtastic, route contains intermediate hops; the responding destination is target_sender
-                    dest_num = self.trace_target_num or target_sender
-                    if dest_num:
-                        node = self._get_or_create_node(dest_num)
-                        node.last_route = route
-                        node.last_route_snr_towards = snr_towards
-                        node.last_route_snr_back = snr_back
-                        node.last_route_time = time.time()
-
-                    if target_sender and target_sender != dest_num:
-                        node = self._get_or_create_node(target_sender)
-                        node.last_route = route
-                        node.last_route_snr_towards = snr_towards
-                        node.last_route_snr_back = snr_back
-                        node.last_route_time = time.time()
-
-                    self._log_trace_history(dest_num or target_sender, route, snr_towards, snr_back)
-                    self._save_traced_stations()
-
-                    is_auto = getattr(self, "auto_trace_in_progress", False)
-                    should_update_ui = not is_auto or (self.view_mode == "TRACE" and self.trace_target_num in (dest_num, target_sender))
-                    if should_update_ui:
-                        with self.trace_lock:
-                            self.trace_result = {
-                                "dest_num": dest_num,
-                                "route": route,
-                                "snr_towards": snr_towards,
-                                "snr_back": snr_back,
-                                "ts": self.trace_started_at or time.time(),
-                                "error": None,
-                                "elapsed": time.time() - (self.trace_started_at or time.time()),
-                            }
-                        # allow quick re-run
-                        self.trace_deadline = 0.0
-                        self.trace_cooldown_end = time.time() + 0.5
-            except Exception as _e:
-                is_auto = getattr(self, "auto_trace_in_progress", False)
-                should_update_ui = not is_auto or (self.view_mode == "TRACE")
-                if should_update_ui:
-                    with self.trace_lock:
-                        self.trace_result = self.trace_result or {}
-                        self.trace_result["error"] = f"PARSE ERROR: {_e}"
-                        self.trace_result["elapsed"] = time.time() - (self.trace_started_at or time.time())
-                    self.trace_deadline = 0.0
-                    self.trace_cooldown_end = time.time() + 0.5
+        # Replies to our own traceroutes are handled by _on_trace_response (registered
+        # per request). Here we only pick up traceroute replies addressed to our node
+        # for requests someone else made (e.g. the phone app on the same radio).
+        if pn_name == "TRACEROUTE_APP":
+            rd = d.get("traceroute")
+            req = d.get("requestId")
+            with self.trace_lock:
+                ours = req in self._handled_trace_ids
+                self._handled_trace_ids.discard(req)
+            if (isinstance(rd, dict) and req is not None and not ours and num is not None
+                    and self.local_num is not None and packet.get("to") == self.local_num):
+                self._record_route(num, _ints(rd.get("route")), _ints(rd.get("snrTowards")),
+                                   _ints(rd.get("routeBack")), _ints(rd.get("snrBack")))
+            return
 
         # ============================================================
         # 2) AFTER traceroute handling, skip non-text for the message log
@@ -834,12 +1052,14 @@ class MeshTopApp:
         to_num = packet.get("to")
 
         from_node = self._get_or_create_node(from_num) if from_num is not None else None
-        to_node = self._get_or_create_node(to_num) if to_num is not None else None
+        is_broadcast = to_num == UNKNOWN_HOP  # 0xFFFFFFFF is also the broadcast address
+        # don't invent a node for the broadcast address
+        to_node = self._get_or_create_node(to_num) if to_num is not None and not is_broadcast else None
 
         from_id = from_node.node_id if from_node and from_node.node_id else f"#{from_num}"
-        to_id = to_node.node_id if to_node and to_node.node_id else f"#{to_num}"
+        to_id = "^all" if is_broadcast else (to_node.node_id if to_node and to_node.node_id else f"#{to_num}")
         from_short = from_node.short_name if from_node else "?"
-        to_short = to_node.short_name if to_node else "?"
+        to_short = "ALL" if is_broadcast else (to_node.short_name if to_node else "?")
 
         direction = "IN"
         if self.local_num is not None and from_num == self.local_num:
@@ -870,7 +1090,8 @@ class MeshTopApp:
                 'from_id': from_id,
                 'from_name': from_short,
                 'to_id': to_id,
-                'broadcast': False,
+                'to_name': to_short,
+                'broadcast': is_broadcast,
                 'text': text,
                 'msg_id': packet.get('id'),
                 'ack': (status == 'RECEIVED' and d.get('requestId') is None),
@@ -888,10 +1109,40 @@ class MeshTopApp:
     def send_text_to_node(self, target_num: int, text: str):
         with self.data_lock:
             node = self.nodes.get(target_num)
-            to_id = (node.node_id if node and node.node_id else f"#{target_num}")
-            to_short = (node.short_name if node and node.short_name else "?")
+        to_id = (node.node_id if node and node.node_id else f"#{target_num}")
+        to_short = (node.short_name if node and node.short_name else "?")
+        clean_text = safe_text(text)
+        while len(clean_text.encode("utf-8")) > MAX_TEXT_BYTES:
+            clean_text = clean_text[:-1]
 
-        # best-effort outbound log (pre-send)
+        def note(err_text):
+            with self.data_lock:
+                self.messages.append(MessageInfo(
+                    timestamp=time.time(), direction="OUT",
+                    from_id=self.local_id or "^local", from_short=self.local_short,
+                    to_id=to_id, to_short=to_short, text=err_text, status="UNKNOWN"))
+
+        iface = self.iface
+        if iface is None or not iface.isConnected.is_set():
+            note(f"[NOT SENT – not connected] {clean_text}")
+            return
+
+        try:
+            pkt = iface.sendText(clean_text, destinationId=target_num, wantAck=True)
+        except BaseException as e:
+            # BaseException: the meshtastic library calls sys.exit() on some bad inputs,
+            # which would otherwise close the whole app.
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            note(f"[SEND ERROR: {e or e.__class__.__name__}] {clean_text}")
+            return
+
+        with self.data_lock:
+            self.messages.append(MessageInfo(
+                timestamp=time.time(), direction="OUT",
+                from_id=self.local_id or "^local", from_short=self.local_short,
+                to_id=to_id, to_short=to_short, text=clean_text, status="SENT",
+                pkt_id=getattr(pkt, "id", None)))
         try:
             self.archiver.write({
                 'ts_iso': MessageArchiver.now_iso(),
@@ -899,9 +1150,10 @@ class MeshTopApp:
                 'from_id': self.local_id or '^local',
                 'from_name': self.local_short,
                 'to_id': to_id,
+                'to_name': to_short,
                 'broadcast': False,
-                'text': text,
-                'msg_id': None,
+                'text': clean_text,
+                'msg_id': getattr(pkt, "id", None),
                 'ack': False,
                 'hop_limit': None,
                 'rssi': None,
@@ -912,61 +1164,6 @@ class MeshTopApp:
         except Exception:
             pass
 
-        if not self.iface or not node:
-            return
-
-        dest = node.node_id or node.num
-        if not dest:
-            with self.data_lock:
-                self.messages.append(
-                    MessageInfo(
-                        timestamp=time.time(),
-                        direction="OUT",
-                        from_id=self.local_id or "^local",
-                        from_short=self.local_short,
-                        to_id=f"#{target_num}",
-                        to_short=to_short,
-                        text="[ERROR: invalid target node]",
-                        status="UNKNOWN",
-                    )
-                )
-            return
-
-        clean_text = safe_text(text)
-        target_display_id = node.node_id or f"#{node.num}"
-
-        # append to log immediately
-        with self.data_lock:
-            self.messages.append(
-                MessageInfo(
-                    timestamp=time.time(),
-                    direction="OUT",
-                    from_id=self.local_id or "^local",
-                    from_short=self.local_short,
-                    to_id=target_display_id,
-                    to_short=to_short,
-                    text=clean_text,
-                    status="SENT",
-                )
-            )
-
-        try:
-            self.iface.sendText(clean_text, destinationId=dest, wantAck=True)
-        except Exception as e:
-            with self.data_lock:
-                self.messages.append(
-                    MessageInfo(
-                        timestamp=time.time(),
-                        direction="OUT",
-                        from_id=self.local_id or "^local",
-                        from_short=self.local_short,
-                        to_id=target_display_id,
-                        to_short=to_short,
-                        text=f"[SEND ERROR: {e}]",
-                        status="UNKNOWN",
-                    )
-                )
-
     # ---------- Drawing helpers ----------
 
     def _draw_header(self, stdscr, text: str):
@@ -976,9 +1173,14 @@ class MeshTopApp:
         maxw = w - 1
         if getattr(self, "auto_trace_in_progress", False) and getattr(self, "auto_trace_active_node", None):
             text += f" | [Auto-tracing: {self.auto_trace_active_node}]"
-        stdscr.attron(curses.A_REVERSE)
-        stdscr.addnstr(0, 0, safe_text(text).ljust(maxw), maxw)
-        stdscr.attroff(curses.A_REVERSE)
+        attr = curses.A_REVERSE
+        if self.conn_state != "CONNECTED":
+            state = self.conn_state + (f": {self.conn_error}" if self.conn_error else "")
+            text = f"[{state}] " + text
+            attr |= curses.color_pair(1) | curses.A_BOLD
+        elif self.ui_error:
+            text += f" | UI error: {self.ui_error} (see meshtop.log)"
+        stdscr.addnstr(0, 0, ljust_cells(safe_text(text), maxw), maxw, attr)
 
     def _draw_message_log(self, stdscr, start_row: int, max_rows: int):
         h, w = stdscr.getmaxyx()
@@ -1085,42 +1287,22 @@ class MeshTopApp:
             return
 
         def name_from_num(n):
-            n = int(n)
-            with self.data_lock:
-                has_node = n in self.nodes
-                if has_node:
-                    nn = self.nodes[n]
-                    long_name = nn.long_name
-                    short_name = nn.short_name
-                    node_id = nn.node_id
-            if has_node:
-                name = long_name
-                if not name or name == "?":
-                    name = short_name
-                if not name or name == "?":
-                    name = node_id
-                if not name or name == "?":
-                    name = f"#{n}"
-                return name
-            return f"#{n}"
+            return self._node_label(int(n), prefer_long=True)
 
         # Build the full route including us and the destination
-        local_num = self.local_num or tr.get("to_num")
+        local_num = self.local_num
         dest_num = tr.get("dest_num")
-        intermediate_hops = route
+        route_back = tr.get("route_back", []) or []
 
-        full_route = []
-        if local_num is not None:
-            full_route.append(local_num)
-        for h_num in intermediate_hops:
-            if h_num not in full_route and h_num != dest_num:
-                full_route.append(h_num)
-        if dest_num is not None and dest_num not in full_route:
+        # Unknown relays (0xFFFFFFFF) may repeat, so they are not de-duplicated
+        full_route = [local_num] if local_num is not None else []
+        full_route += [h for h in route if h != dest_num and h != local_num]
+        if dest_num is not None:
             full_route.append(dest_num)
 
         names = [name_from_num(n) for n in full_route]
-        if self.local_num is not None and full_route and full_route[0] == self.local_num:
-            names[0] = self.local_long or self.local_short or "ME"
+        # back SNRs line up with the forward hops only if the reply took the same path
+        same_path = not route_back or list(reversed(route_back)) == list(route)
 
         # Draw vertical path
         stdscr.addnstr(y, 0, "Trace Path Discovery:".ljust(maxw), maxw, curses.A_BOLD)
@@ -1139,7 +1321,7 @@ class MeshTopApp:
 
                 # Backward SNR
                 back_idx = len(names) - 2 - i
-                back_val = snr_back[back_idx] if (back_idx >= 0 and back_idx < len(snr_back)) else None
+                back_val = snr_back[back_idx] if (same_path and 0 <= back_idx < len(snr_back)) else None
                 back_txt = f"{back_val / 4.0:+.1f} dB" if (back_val is not None and back_val != -128) else "? dB"
 
                 if y >= h - 2:
@@ -1157,6 +1339,23 @@ class MeshTopApp:
                 stdscr.addnstr(y, 2, "   v", maxw)
                 y += 1
 
+        if not same_path and y < h - 2:
+            back_names = [name_from_num(dest_num)] + [name_from_num(n) for n in route_back] + [names[0]]
+            parts = []
+            for i, nm in enumerate(back_names):
+                parts.append(f"[{nm}]")
+                if i < len(back_names) - 1:
+                    v = snr_back[i] if i < len(snr_back) else None
+                    parts.append(f" -({v / 4.0:+.1f}dB)-> " if v not in (None, -128) else " -> ")
+            y += 1
+            stdscr.addnstr(y, 0, "Return path (differs from forward):", maxw, curses.A_BOLD)
+            y += 1
+            for line in wrap_cells("".join(parts), maxw - 2):
+                if y >= h - 2:
+                    break
+                stdscr.addnstr(y, 2, line, maxw - 2)
+                y += 1
+
         stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [s] stats  [q] quit".ljust(maxw), maxw)
 
     def _draw_nodes_view(self, stdscr):
@@ -1169,13 +1368,10 @@ class MeshTopApp:
         top = 1
         rows_avail = h - 7  # leave space for log + footer + route info
 
-        with self.data_lock:
-            nodes_list = list(self.nodes.values())
-        nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
+        nodes_list = self._sorted_nodes()
 
-        # 1. Safety check: ensure selection is within bounds
-        if self.selected_node_index >= len(nodes_list):
-            self.selected_node_index = max(0, len(nodes_list) - 1)
+        # 1. Follow the selected node through re-sorts, and keep the index in bounds
+        self._sync_node_selection(nodes_list)
 
         # 2. SCROLL LOGIC: Adjust offset to keep the selected node visible
         if self.selected_node_index < self.node_view_offset:
@@ -1219,13 +1415,13 @@ class MeshTopApp:
                     break
 
         x = 0
-        stdscr.attron(curses.A_BOLD)
         for name, wd in cols:
             if x >= maxw:
                 break
-            stdscr.addnstr(top, x, name.ljust(wd), wd)
+            stdscr.addnstr(top, x, name.ljust(wd), min(wd, maxw - x), curses.A_BOLD)
             x += wd + 1
-        stdscr.attroff(curses.A_BOLD)
+
+        routers = self._router_nums()
 
         # Slice the list based on offset
         visible_nodes = nodes_list[self.node_view_offset:self.node_view_offset + rows_avail]
@@ -1241,12 +1437,13 @@ class MeshTopApp:
             attrs = 0
             if real_index == self.selected_node_index:
                 attrs |= curses.A_REVERSE
-            if node.is_me:
-                attrs |= curses.color_pair(3)
-            elif self._is_router(node.num):
-                attrs |= curses.color_pair(2)
+            # one color per row (OR-ing color pairs together gives a random third color)
             if node.battery_low:
                 attrs |= curses.color_pair(1)
+            elif node.is_me:
+                attrs |= curses.color_pair(3)
+            elif node.num in routers:
+                attrs |= curses.color_pair(2)
 
             id_str = node.node_id or f"#{node.num}"
             if len(id_str) > 11:
@@ -1264,13 +1461,7 @@ class MeshTopApp:
                 if len(node.last_route) == 0:
                     route_str = "DIRECT"
                 else:
-                    names = []
-                    for n in node.last_route:
-                        if n in self.nodes:
-                            names.append(self.nodes[n].short_name or "?")
-                        else:
-                            names.append("?")
-                    route_str = ">".join(names)
+                    route_str = ">".join(self._node_label(n) for n in node.last_route)
 
             bat_str = f"{node.battery:>3}%" if node.battery is not None else " --%"
             v_str = f"{node.voltage:.2f}" if node.voltage is not None else " -- "
@@ -1303,7 +1494,8 @@ class MeshTopApp:
             for (name, wd), val in zip(cols, data):
                 if x >= maxw:
                     break
-                stdscr.addnstr(row_y, x, safe_text(str(val))[:wd].ljust(wd), wd, attrs)
+                cell = ljust_cells(safe_text(str(val)), wd)
+                stdscr.addnstr(row_y, x, cell + " ", min(wd + 1, maxw - x), attrs)
                 x += wd + 1
 
         topo_row = h - 5
@@ -1316,13 +1508,7 @@ class MeshTopApp:
         route_info_row = h - 4
         selected_node = nodes_list[self.selected_node_index] if nodes_list else None
         if selected_node and getattr(selected_node, "last_route", None) is not None:
-            hops_names = []
-            for n in selected_node.last_route:
-                if n in self.nodes:
-                    nn = self.nodes[n]
-                    hops_names.append(f"{nn.short_name or nn.node_id or f'#{n}'}")
-                else:
-                    hops_names.append(f"#{n}")
+            hops_names = [self._node_label(n) for n in selected_node.last_route]
             route_path = " -> ".join(hops_names)
             if not route_path:
                 route_path = "DIRECT"
@@ -1365,6 +1551,20 @@ class MeshTopApp:
 
         footer = "[↑↓] select node  [Enter] send  [t] trace  [m] msgs  [s] stats  [p] export  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
+
+    def _sorted_nodes(self) -> List[NodeInfo]:
+        with self.data_lock:
+            nodes_list = list(self.nodes.values())
+        nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
+        return nodes_list
+
+    def _sync_node_selection(self, nodes_list: List[NodeInfo]):
+        nums = [n.num for n in nodes_list]
+        if self.selected_node_num in nums:
+            self.selected_node_index = nums.index(self.selected_node_num)
+        else:
+            self.selected_node_index = max(0, min(self.selected_node_index, len(nums) - 1))
+            self.selected_node_num = nums[self.selected_node_index] if nums else None
 
     def _get_chat_partners(self):
         with self.data_lock:
@@ -1411,8 +1611,7 @@ class MeshTopApp:
             stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
             return
 
-        # Clamp selection index
-        self.selected_chat_index = max(0, min(self.selected_chat_index, len(chat_partners) - 1))
+        self._sync_chat_selection(chat_partners)
         active_partner = chat_partners[self.selected_chat_index]
 
         # Split layout columns
@@ -1426,15 +1625,16 @@ class MeshTopApp:
                 break
 
             name = partner.short_name or partner.node_id or f"#{partner.num}"
-            if len(name) > left_w:
-                name = name[:left_w-3] + "..."
+            if partner.long_name and partner.long_name != "?" and partner.long_name != name:
+                name = f"{name} {partner.long_name}"
+            if text_width(name) > left_w:
+                name = clip_cells(name, left_w - 1) + "…"
 
             attrs = curses.A_NORMAL
             if idx == self.selected_chat_index:
                 attrs |= curses.A_REVERSE
 
-            line = name.ljust(left_w)
-            stdscr.addnstr(row_y, 0, line, left_w, attrs)
+            stdscr.addnstr(row_y, 0, ljust_cells(name, left_w), left_w, attrs)
 
         # Draw vertical separator line
         if left_w + 1 < w:
@@ -1452,44 +1652,43 @@ class MeshTopApp:
             ]
             
         right_w = w - right_x - 1
-        msg_rows_avail = h - 3
-        
+        msg_rows_avail = h - 3  # rows 1..h-3; h-2 is the input line, h-1 the footer
+
         if not chat_msgs:
-            stdscr.addnstr(
-                top,
-                right_x,
-                "(no messages in this conversation yet)".ljust(right_w),
-                right_w,
-            )
+            stdscr.addnstr(top, right_x, "(no messages in this conversation yet)", right_w)
         else:
-            visible_msgs = chat_msgs[-msg_rows_avail:]
-            for idx, msg in enumerate(visible_msgs):
-                row_y = top + idx
-                if row_y >= h - 1:
-                    break
-                    
+            partner_name = active_partner.short_name or active_partner.node_id or f"#{active_partner.num}"
+            # Wrap every message (continuation lines indented), then show the newest rows
+            rendered = []
+            for msg in chat_msgs[-msg_rows_avail:]:
                 t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
-                
-                # Determine sender name & colors
                 if msg.direction == "OUT":
-                    sender = "Me"
-                    attrs = curses.color_pair(3)  # Yellow
+                    sender, attrs = "Me", curses.color_pair(3)  # Yellow
                 else:
-                    sender = active_partner.short_name or active_partner.node_id or f"#{active_partner.num}"
-                    attrs = curses.color_pair(5)  # Cyan
-                    
+                    sender, attrs = partner_name, curses.color_pair(5)  # Cyan
+                if msg.status == "UNKNOWN":
+                    attrs = curses.color_pair(1)  # send errors in red
                 prefix = f"[{t_str}] {sender}: "
-                text_space = max(5, right_w - len(prefix))
-                txt = safe_text(msg.text)[:text_space]
-                
-                line = (prefix + txt).ljust(right_w)
-                stdscr.addnstr(row_y, right_x, line, right_w, attrs)
-                
+                indent = min(text_width(prefix), right_w // 3)
+                lines = wrap_cells(prefix + safe_text(msg.text), max(5, right_w - indent))
+                rendered.append((lines[0], attrs))
+                rendered.extend((" " * indent + line, attrs) for line in lines[1:])
+            for idx, (line, attrs) in enumerate(rendered[-msg_rows_avail:]):
+                stdscr.addnstr(top + idx, right_x, line, right_w, attrs)
+
         # Footer
         footer = "[↑↓] select chat  [Enter] write  [n] nodes view  [s] stats view  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
     # ---------- Input handling ----------
+
+    def _sync_chat_selection(self, chat_partners: List[NodeInfo]):
+        nums = [n.num for n in chat_partners]
+        if self.selected_chat_num in nums:
+            self.selected_chat_index = nums.index(self.selected_chat_num)
+        else:
+            self.selected_chat_index = max(0, min(self.selected_chat_index, len(nums) - 1))
+            self.selected_chat_num = nums[self.selected_chat_index] if nums else None
 
     def _start_input(self, target_num: int):
         self.input_mode = True
@@ -1497,35 +1696,41 @@ class MeshTopApp:
         self.input_target_num = target_num
 
     def _handle_input_char(self, ch):
-        if ch in (curses.KEY_ENTER, 10, 13):
+        """ch is a str (typed character, any language) or an int (special key)."""
+        if ch in (curses.KEY_ENTER, "\n", "\r"):
             if self.input_target_num is not None and self.input_text.strip():
                 self.send_text_to_node(self.input_target_num, self.input_text.strip())
             self.input_mode = False
             self.input_text = ""
             self.input_target_num = None
             return
-        if ch in (27,):  # ESC
+        if ch == "\x1b":  # ESC
             self.input_mode = False
             self.input_text = ""
             self.input_target_num = None
             return
-        if ch in (curses.KEY_BACKSPACE, 127, 8):
+        if ch in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
             self.input_text = self.input_text[:-1]
             return
-        if 32 <= ch <= 126:
-            self.input_text += chr(ch)
+        if ch == "\x15":  # Ctrl-U clears the line
+            self.input_text = ""
+            return
+        if isinstance(ch, str) and ch.isprintable():
+            if len((self.input_text + ch).encode("utf-8")) <= MAX_TEXT_BYTES:
+                self.input_text += ch
+            else:
+                curses.beep()
 
     def _handle_nodes_keys(self, ch):
-        with self.data_lock:
-            nodes_list = list(self.nodes.values())
-        nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
+        nodes_list = self._sorted_nodes()
+        self._sync_node_selection(nodes_list)
 
-        if ch == curses.KEY_UP:
-            self.selected_node_index = max(0, self.selected_node_index - 1)
-        elif ch == curses.KEY_DOWN:
-            self.selected_node_index = min(
-                max(0, len(nodes_list) - 1), self.selected_node_index + 1
-            )
+        if ch in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_HOME, curses.KEY_END):
+            step = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -10,
+                    curses.KEY_NPAGE: 10, curses.KEY_HOME: -10**9, curses.KEY_END: 10**9}[ch]
+            if nodes_list:
+                self.selected_node_index = max(0, min(len(nodes_list) - 1, self.selected_node_index + step))
+                self.selected_node_num = nodes_list[self.selected_node_index].num
         elif ch in (curses.KEY_ENTER, 10, 13):
             if nodes_list:
                 target = nodes_list[self.selected_node_index]
@@ -1535,28 +1740,19 @@ class MeshTopApp:
                 target = nodes_list[self.selected_node_index]
                 self.trace_target_num = target.num
                 self.view_mode = "TRACE"
-                self._need_full_clear = True  # <— add this
+                self._need_full_clear = True
                 self._send_trace_to_current()
-        elif ch in (ord('p'), ord('P')):
-            self._export_topology()
-
-
-
-
-
-
 
     def _handle_msgs_keys(self, ch):
         chat_partners = self._get_chat_partners()
         if not chat_partners:
             return
+        self._sync_chat_selection(chat_partners)
 
-        if ch == curses.KEY_UP:
-            self.selected_chat_index = max(0, self.selected_chat_index - 1)
-            self._need_full_clear = True
-        elif ch == curses.KEY_DOWN:
-            self.selected_chat_index = min(len(chat_partners) - 1, self.selected_chat_index + 1)
-            self._need_full_clear = True
+        if ch in (curses.KEY_UP, curses.KEY_DOWN):
+            step = -1 if ch == curses.KEY_UP else 1
+            self.selected_chat_index = max(0, min(len(chat_partners) - 1, self.selected_chat_index + step))
+            self.selected_chat_num = chat_partners[self.selected_chat_index].num
         elif ch in (10, 13, curses.KEY_ENTER):
             partner = chat_partners[self.selected_chat_index]
             self._start_input(partner.num)
@@ -1565,16 +1761,12 @@ class MeshTopApp:
         if ch in (curses.KEY_UP, ord('k'), ord('K')):
             if self.stats_scroll_offset > 0:
                 self.stats_scroll_offset -= 1
-                self._need_full_clear = True
         elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
             self.stats_scroll_offset += 1
-            self._need_full_clear = True
         elif ch == curses.KEY_NPAGE: # Page Down
             self.stats_scroll_offset += 10
-            self._need_full_clear = True
         elif ch == curses.KEY_PPAGE: # Page Up
             self.stats_scroll_offset = max(0, self.stats_scroll_offset - 10)
-            self._need_full_clear = True
 
     # ---------- curses main loop ----------
 
@@ -1674,6 +1866,7 @@ class MeshTopApp:
                         "last_route": node.last_route,
                         "last_route_snr_towards": node.last_route_snr_towards,
                         "last_route_snr_back": node.last_route_snr_back,
+                        "last_route_back": node.last_route_back,
                         "last_route_time": node.last_route_time
                     }
 
@@ -1724,9 +1917,11 @@ class MeshTopApp:
                 node.last_route = trace_info.get("last_route")
                 node.last_route_snr_towards = trace_info.get("last_route_snr_towards")
                 node.last_route_snr_back = trace_info.get("last_route_snr_back")
+                node.last_route_back = trace_info.get("last_route_back")
                 node.last_route_time = trace_info.get("last_route_time")
 
     def run_curses(self, stdscr):
+        stdscr = SafeWin(stdscr)
         try:
             curses.curs_set(0)
         except curses.error:
@@ -1736,129 +1931,137 @@ class MeshTopApp:
 
         if curses.has_colors():
             curses.start_color()
-            curses.use_default_colors()
-            # init pairs (use 4 for blue to avoid clashes)
             try:
-                curses.init_pair(1, curses.COLOR_RED, -1)  # low battery
-                curses.init_pair(2, curses.COLOR_GREEN, -1)  # router nodes
-                curses.init_pair(3, curses.COLOR_YELLOW, -1)  # my node
-                curses.init_pair(4, curses.COLOR_BLUE, -1)  # messages to me (pair 4)
-                curses.init_pair(5, curses.COLOR_CYAN, -1)  # received messages (pair 5)
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            try:
+                curses.init_pair(1, curses.COLOR_RED, bg)  # low battery / errors
+                curses.init_pair(2, curses.COLOR_GREEN, bg)  # router nodes
+                curses.init_pair(3, curses.COLOR_YELLOW, bg)  # my node
+                curses.init_pair(4, curses.COLOR_BLUE, bg)  # messages to me
+                curses.init_pair(5, curses.COLOR_CYAN, bg)  # received messages
             except curses.error:
                 pass
 
         while self.running:
-            stdscr.erase()
-            # force a one-shot full clear if requested
-            if self._need_full_clear:
-                stdscr.clear()
-                stdscr.refresh()
-                self._need_full_clear = False
+            # A bug in one frame must not take the whole app down: log it, show it, keep going.
+            try:
+                self._draw_frame(stdscr)
+            except Exception as e:
+                self._report_ui_error(e)
 
-            h, w = stdscr.getmaxyx()
-            # --- auto-timeout from TRACE ---
-            if self.view_mode == "TRACE":
-                with self.trace_lock:
-                    tr = dict(self.trace_result) if self.trace_result is not None else {}
-                started = tr.get("ts") or self.trace_started_at
-                no_result_yet = not tr.get("route") and not tr.get("error")
-                if started and no_result_yet:
-                    elapsed = time.time() - started
-                    if elapsed >= self.trace_timeout_sec:
-                        with self.trace_lock:
-                            if self.trace_result is not None and not self.trace_result.get("error"):
-                                self.trace_result["error"] = "Timeout (no response)"
-                        # if the background call is still stuck, we still return to NODES;
-                        # the UI won't block and the thread will end whenever it ends.
-                        self.view_mode = "NODES"
-
-            if h < 10 or w < 60:
-                msg = "meshtop: enlarge terminal (>=60x10). Press q to quit."
-                maxw = max(1, w - 1)
-                stdscr.addnstr(0, 0, msg[:maxw].ljust(maxw), maxw)
-                stdscr.refresh()
-                ch = stdscr.getch()
-                if ch in (ord("q"), ord("Q")):
-                    self.running = False
-                    break
+            try:
+                ch = stdscr.get_wch()
+            except curses.error:
+                continue  # timeout, no key
+            if ch == curses.KEY_RESIZE:
+                self._need_full_clear = True
                 continue
+            try:
+                self._handle_key(ch)
+            except Exception as e:
+                self._report_ui_error(e)
 
-            if self.input_mode:
-                if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, p export, q quit)")
-                    self._draw_nodes_view(stdscr)
-                elif self.view_mode == "TRACE":
-                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
-                    self._draw_trace_view(stdscr)
-                else:
-                    # where you draw the MESSAGES header:
-                    self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, s stats, p export, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+    def _report_ui_error(self, e: Exception):
+        self.ui_error = f"{e.__class__.__name__}: {e}"
+        log.error("UI error:\n%s", traceback.format_exc())
 
-                    self._draw_messages_view(stdscr)
+    def _draw_frame(self, stdscr):
+        stdscr.erase()
+        # force a one-shot full clear if requested
+        if self._need_full_clear:
+            stdscr.clear()
+            self._need_full_clear = False
 
-                maxw = w - 1
-                prompt = "Message (Enter=send, Esc=cancel): "
-                txt = safe_text(self.input_text)
-                line = (prompt + txt)[:maxw].ljust(maxw)
-                stdscr.addnstr(h - 2, 0, line, maxw)
-                stdscr.move(h - 2, min(maxw - 1, len(prompt) + len(txt)))
-            else:
-                if self.view_mode == "NODES":
-                    self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, p export, q quit)")
-                    self._draw_nodes_view(stdscr)
-                elif self.view_mode == "TRACE":
-                    self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
-                    self._draw_trace_view(stdscr)
-                elif self.view_mode == "STATS":
-                    self._draw_header(stdscr, "meshtop – STATS (n nodes, m messages, p export, q quit)")
-                    self._draw_stats_view(stdscr)
-                else:
-                    # where you draw the MESSAGES header:
-                    self._draw_header(stdscr,
-                                      f"meshtop – MESSAGES (n nodes, s stats, p export, q quit)  [g] filter={'ON' if self.hide_gibberish else 'OFF'}")
+        self._check_trace_timeout()
 
-                    self._draw_messages_view(stdscr)
-
-
-
+        h, w = stdscr.getmaxyx()
+        if h < 10 or w < 60:
+            msg = f"meshtop: enlarge terminal (>=60x10, now {w}x{h}). Press q to quit."
+            stdscr.addnstr(0, 0, msg, max(1, w - 1))
             stdscr.refresh()
-            ch = stdscr.getch()
-            if ch == -1:
-                continue
+            return
 
-            if self.input_mode:
-                self._handle_input_char(ch)
-                continue
-            if ch in (ord('g'), ord('G')):
-                self.hide_gibberish = not self.hide_gibberish
-                continue
+        filt = f"  [g] filter={'ON' if self.hide_gibberish else 'OFF'}"
+        if self.view_mode == "NODES":
+            self._draw_header(stdscr, "meshtop – NODES (m messages, t trace, s stats, p export, q quit)")
+            self._draw_nodes_view(stdscr)
+        elif self.view_mode == "TRACE":
+            self._draw_header(stdscr, "meshtop – TRACE (t retry, n nodes, m messages, s stats, q quit)")
+            self._draw_trace_view(stdscr)
+        elif self.view_mode == "STATS":
+            self._draw_header(stdscr, "meshtop – STATS (n nodes, m messages, p export, q quit)")
+            self._draw_stats_view(stdscr)
+        else:
+            self._draw_header(stdscr, "meshtop – MESSAGES (n nodes, s stats, p export, q quit)" + filt)
+            self._draw_messages_view(stdscr)
 
-            if ch in (ord("q"), ord("Q")):
-                self.running = False
-                break
-            if ch in (ord("m"), ord("M")):
-                self.view_mode = "MSGS"
-                self._need_full_clear = True
-                continue
-            if ch in (ord("n"), ord("N")):
-                self.view_mode = "NODES"
-                self._need_full_clear = True
-                continue
-            if ch in (ord("s"), ord("S")):
-                self.view_mode = "STATS"
-                self._need_full_clear = True
-                continue
+        if self.input_mode:
+            maxw = w - 1
+            to = self._node_label(self.input_target_num)
+            used = len(self.input_text.encode("utf-8"))
+            prompt = f"To {to} [{used}/{MAX_TEXT_BYTES}] (Enter=send, Esc=cancel): "
+            txt = safe_text(self.input_text)
+            room = max(1, maxw - text_width(prompt) - 1)
+            while text_width(txt) > room:  # keep the end of a long message visible
+                txt = txt[1:]
+            stdscr.addnstr(h - 2, 0, ljust_cells(prompt + txt, maxw), maxw, curses.A_BOLD)
+            stdscr.move(h - 2, min(maxw - 1, text_width(prompt) + text_width(txt)))
+        self._set_cursor(self.input_mode)
+        stdscr.refresh()
 
-            if self.view_mode == "NODES":
-                self._handle_nodes_keys(ch)
-            elif self.view_mode == "TRACE":
-                self._handle_trace_keys(ch)
-            elif self.view_mode == "STATS":
-                self._handle_stats_keys(ch)
-            else:
-                self._handle_msgs_keys(ch)
-    def _log_trace_history(self, dest_num, route, snr_towards, snr_back):
+    def _set_cursor(self, visible: bool):
+        if getattr(self, "_cursor_visible", None) != visible:
+            try:
+                curses.curs_set(1 if visible else 0)
+            except curses.error:
+                pass
+            self._cursor_visible = visible
+
+    def _handle_key(self, ch):
+        if self.input_mode:
+            self._handle_input_char(ch)
+            return
+        if isinstance(ch, str):
+            ch = _LAYOUT_TO_LATIN.get(ch, ch)
+            if len(ch) != 1:
+                return
+            ch = ord(ch)
+
+        if ch in (ord('g'), ord('G')):
+            self.hide_gibberish = not self.hide_gibberish
+            return
+        if ch in (ord("q"), ord("Q")):
+            self.running = False
+            return
+        if ch in (ord("m"), ord("M")):
+            self.view_mode = "MSGS"
+            self._need_full_clear = True
+            return
+        if ch in (ord("n"), ord("N")):
+            self.view_mode = "NODES"
+            self._need_full_clear = True
+            return
+        if ch in (ord("s"), ord("S")):
+            self.view_mode = "STATS"
+            self._need_full_clear = True
+            return
+        if ch in (ord("p"), ord("P")):
+            self._export_topology()
+            return
+
+        if self.view_mode == "NODES":
+            self._handle_nodes_keys(ch)
+        elif self.view_mode == "TRACE":
+            self._handle_trace_keys(ch)
+        elif self.view_mode == "STATS":
+            self._handle_stats_keys(ch)
+        else:
+            self._handle_msgs_keys(ch)
+
+    def _log_trace_history(self, dest_num, route, snr_towards, snr_back, route_back=None):
         dest_short = ""
         with self.data_lock:
             n = self.nodes.get(dest_num)
@@ -1871,6 +2074,7 @@ class MeshTopApp:
             "dest_short": dest_short,
             "route": route,
             "snr_towards": snr_towards,
+            "route_back": route_back or [],
             "snr_back": snr_back
         }
         
@@ -2127,29 +2331,28 @@ class MeshTopApp:
         footer = "[n] nodes  [m] messages  [s] stats  [↑/↓] scroll tree  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
-    def _is_router(self, node_num) -> bool:
-        # A node is a router if it connects ME to >= 2 nodes.
-        # This includes itself (if direct/connected) and any other nodes that use it as a relay/hop.
-        if node_num == self.local_num:
-            return False
-
-        connected_nodes = set()
-
+    def _router_nums(self) -> set:
+        """
+        Nodes that connect ME to >= 2 traced nodes: themselves (if traced) plus every
+        other node whose route goes through them. Computed once per frame.
+        """
         with self.data_lock:
-            # 1. If we have a route to this node, it is connected to us.
-            node = self.nodes.get(node_num)
-            if node and getattr(node, "last_route", None) is not None:
-                connected_nodes.add(node_num)
+            traced = [(num, n.last_route) for num, n in self.nodes.items()
+                      if num != self.local_num and n.last_route is not None]
+        connected: Dict[int, set] = {}
+        traced_nums = {num for num, _ in traced}
+        for num, route in traced:
+            for hop in set(route):
+                if hop not in (num, self.local_num, UNKNOWN_HOP):
+                    connected.setdefault(hop, set()).add(num)
+        routers = set()
+        for hop, users in connected.items():
+            if len(users) + (1 if hop in traced_nums else 0) >= 2:
+                routers.add(hop)
+        return routers
 
-            # 2. Add all other nodes that have this node in their path
-            for num, n in self.nodes.items():
-                if num == self.local_num or num == node_num:
-                    continue
-                route = getattr(n, "last_route", None)
-                if route and node_num in route:
-                    connected_nodes.add(num)
-
-        return len(connected_nodes) >= 2
+    def _is_router(self, node_num) -> bool:
+        return node_num in self._router_nums()
 
     def _mermaid_node_id(self, node_num):
         if node_num is not None and node_num == self.local_num:
@@ -2271,6 +2474,41 @@ class MeshTopApp:
         except Exception:
             pass
 
+    def _auto_trace_one(self, num: int, node_name: str, last_attempt_times: dict) -> bool:
+        """Trace one node, wait for the reply, then pause 30 s. Returns True if it answered."""
+        with self.data_lock:
+            node = self.nodes.get(num)
+            if not node or not node.last_seen:
+                return True  # nothing to do; don't queue a retry
+        # wait for any manual trace (or a dropped connection) to clear
+        while self.running and (self._trace_active() or self.iface is None):
+            time.sleep(1)
+        if not self.running:
+            return True
+
+        self.auto_trace_active_node = node_name
+        last_attempt_times[num] = time.time()
+        answered = False
+        try:
+            inflight = self._send_traceroute(num, "auto")
+            while self.running and not inflight["done"].wait(0.2):
+                if time.time() >= inflight["deadline"]:
+                    self._finish_trace(inflight, ok=False)
+            answered = inflight["ok"]
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            log.warning("auto-trace to %s failed: %s", node_name, e)
+        finally:
+            self.auto_trace_active_node = None
+
+        # Keep 30 sec pause between scans to avoid congesting the channel
+        for _ in range(300):
+            if not self.running:
+                break
+            time.sleep(0.1)
+        return answered
+
     def _auto_trace_loop(self):
         # Wait until the first non-local node is SEEN
         while self.running:
@@ -2313,123 +2551,26 @@ class MeshTopApp:
                                 needs_trace = True
                                 
                         if needs_trace:
-                            eligible_nodes.append((num, node.node_id or node.num, node.short_name or node.long_name or f"#{node.num}"))
+                            eligible_nodes.append((num, node.short_name or node.long_name or f"#{node.num}"))
             
             if eligible_nodes:
                 try:
                     self.auto_trace_in_progress = True
+                    # Pass 1 traces every eligible node, pass 2 retries the silent ones once
                     no_answer_nodes = []
-                    
-                    # --- PASS 1: Trace all eligible seen nodes ---
-                    for num, dest, node_name in eligible_nodes:
+                    for num, node_name in eligible_nodes:
                         if not self.running:
                             break
-                        
-                        with self.data_lock:
-                            node = self.nodes.get(num)
-                            if not node or getattr(node, "last_seen", 0) == 0:
-                                continue
-                        
-                        while self._trace_active() and self.running:
-                            time.sleep(1)
-                            
-                        self.auto_trace_active_node = node_name
-                        last_attempt_times[num] = time.time()
-                        
-                        if self.iface and hasattr(self.iface, "_acknowledgment"):
-                            self.iface._acknowledgment.receivedTraceRoute = False
-                            
-                        try:
-                            if self.iface:
-                                from meshtastic.protobuf import mesh_pb2, portnums_pb2
-                                r = mesh_pb2.RouteDiscovery()
-                                self.iface.sendData(
-                                    r,
-                                    destinationId=dest,
-                                    portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
-                                    wantResponse=True,
-                                    onResponse=self.iface.onResponseTraceRoute,
-                                    channelIndex=0,
-                                    hopLimit=7
-                                )
-                                for _ in range(120):
-                                    if not self.running:
-                                        break
-                                    if self._trace_active():
-                                        break
-                                    if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
-                                        break
-                                    time.sleep(0.1)
-                        except Exception:
-                            pass
-                            
-                        answered = False
-                        if self.iface and hasattr(self.iface, "_acknowledgment"):
-                            answered = self.iface._acknowledgment.receivedTraceRoute
-                            
-                        if not answered:
-                            no_answer_nodes.append((num, dest, node_name))
-                            
-                        self.auto_trace_active_node = None
-                        # Keep 30 sec pause between scans
-                        for _ in range(30):
-                            if not self.running:
-                                break
-                            time.sleep(1)
-                            
-                    # --- PASS 2: Return to no-answer nodes ---
-                    if no_answer_nodes and self.running:
-                        for num, dest, node_name in no_answer_nodes:
-                            if not self.running:
-                                break
-                                
-                            with self.data_lock:
-                                node = self.nodes.get(num)
-                                if not node or getattr(node, "last_seen", 0) == 0:
-                                    continue
-                                    
-                            while self._trace_active() and self.running:
-                                time.sleep(1)
-                                
-                            self.auto_trace_active_node = f"{node_name} (retry)"
-                            last_attempt_times[num] = time.time()
-                            
-                            if self.iface and hasattr(self.iface, "_acknowledgment"):
-                                self.iface._acknowledgment.receivedTraceRoute = False
-                                
-                            try:
-                                if self.iface:
-                                    from meshtastic.protobuf import mesh_pb2, portnums_pb2
-                                    r = mesh_pb2.RouteDiscovery()
-                                    self.iface.sendData(
-                                        r,
-                                        destinationId=dest,
-                                        portNum=portnums_pb2.PortNum.TRACEROUTE_APP,
-                                        wantResponse=True,
-                                        onResponse=self.iface.onResponseTraceRoute,
-                                        channelIndex=0,
-                                        hopLimit=7
-                                    )
-                                    for _ in range(120):
-                                        if not self.running:
-                                            break
-                                        if self._trace_active():
-                                            break
-                                        if self.iface and hasattr(self.iface, "_acknowledgment") and self.iface._acknowledgment.receivedTraceRoute:
-                                            break
-                                        time.sleep(0.1)
-                            except Exception:
-                                pass
-                                
-                            self.auto_trace_active_node = None
-                            for _ in range(30):
-                                if not self.running:
-                                    break
-                                time.sleep(1)
+                        if not self._auto_trace_one(num, node_name, last_attempt_times):
+                            no_answer_nodes.append((num, node_name))
+                    for num, node_name in no_answer_nodes:
+                        if not self.running:
+                            break
+                        self._auto_trace_one(num, f"{node_name} (retry)", last_attempt_times)
                 finally:
                     self.auto_trace_active_node = None
                     self.auto_trace_in_progress = False
-            
+
             # Short sleep before checking for new eligible nodes
             for _ in range(5):
                 if not self.running:
@@ -2439,10 +2580,18 @@ class MeshTopApp:
     def run(self):
         try:
             self.connect()
-            # Start auto-trace daemon thread
-            self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True)
+            # Start auto-trace and connection-watchdog daemon threads
+            self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True, name="auto-trace")
             self.auto_trace_thread.start()
-            curses.wrapper(self.run_curses)
+            threading.Thread(target=self._connection_supervisor, daemon=True, name="conn-supervisor").start()
+            # The meshtastic library print()s tracebacks and messages from its threads;
+            # send them to the log file instead of scribbling over the curses screen.
+            saved = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = _LogWriter()
+            try:
+                curses.wrapper(self.run_curses)
+            finally:
+                sys.stdout, sys.stderr = saved
         finally:
             self.running = False
             if getattr(self, "archiver", None):
@@ -2455,6 +2604,31 @@ class MeshTopApp:
                     self.iface.close()
                 except Exception:
                     pass
+
+
+class _LogWriter:
+    """File-like object that forwards writes to the meshtop log."""
+
+    def write(self, data):
+        data = data.rstrip()
+        if data:
+            logging.getLogger("meshtop.stdout").warning(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+def setup_logging():
+    base_dir = Path(__file__).resolve().parent
+    handler = logging.FileHandler(base_dir / "meshtop.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger()
+    root.handlers[:] = [handler]  # nothing goes to the terminal while curses runs
+    root.setLevel(logging.INFO)
 
 
 def get_local_subnet():
@@ -2513,6 +2687,7 @@ def main():
     parser.add_argument("--host", required=False, help="Meshtastic device IP/hostname")
     parser.add_argument("--port", type=int, default=4403)
     args = parser.parse_args()
+    setup_logging()
 
     host = args.host
     if not host:
