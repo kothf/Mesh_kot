@@ -36,8 +36,10 @@ class NodeInfo:
     long_name: str = "?"
     hw_model: str = "?"
 
-    last_seen: float = 0.0
+    last_seen: float = 0.0  # heard live during this session
     seen_packets: int = 0
+    db_last_heard: float = 0.0  # "lastHeard" from the radio's node DB (before we started)
+    hops_away: Optional[int] = None  # from the node DB
 
     last_rssi: Optional[float] = None
     last_snr: Optional[float] = None
@@ -86,6 +88,9 @@ class MessageInfo:
     portnum: str = "TEXT_MESSAGE_APP"
     status: str = "UNKNOWN"  # RECEIVED / SENT
     pkt_id: Optional[int] = None
+    channel: int = 0
+    broadcast: bool = False  # channel message rather than a direct message
+    ack: str = ""  # outgoing only: "pending", "relayed", "delivered" or "failed: REASON"
 
 
 # ---------- Helpers ----------
@@ -371,20 +376,37 @@ for _lat, _ru, _he in zip("qwertyuiopasdfghjklzxcvbnm",
 # Meshtastic text payload limit (bytes of UTF-8), leaving room for encryption overhead
 MAX_TEXT_BYTES = 200
 UNKNOWN_HOP = 0xFFFFFFFF  # firmware puts this in a route for relays it could not identify
+BROADCAST_NUM = 0xFFFFFFFF
 
 
 def _norm(x) -> str:
     """Normalize Meshtastic IDs: strip '!' / '#' and ensure string."""
     return (str(x) if x is not None else '').replace('!', '').replace('#', '')
-def _msg_involves_node(msg: MessageInfo, node: NodeInfo, local_id: Optional[str], local_num: Optional[int]) -> bool:
-    """
-    True if this message is between ME and the given node (either direction).
-    We match on the node_id or the numeric node number (e.g., '#12').
-    """
-    nid = _norm(node.node_id)
-    nnum = str(node.num)
-    return _norm(msg.from_id) in (nid, nnum) or _norm(msg.to_id) in (nid, nnum)
+BROADCAST_IDS = ("^all", "!ffffffff", "#4294967295")
 
+
+def _id_to_num(node_id) -> Optional[int]:
+    """'!b9e5da11' or '#12345' -> node number; None for anything else."""
+    s = str(node_id or "")
+    try:
+        if s.startswith("!") and len(s) == 9:
+            return int(s[1:], 16)
+        if s.startswith("#"):
+            return int(s[1:])
+    except ValueError:
+        pass
+    return None
+
+
+def fmt_ago(seconds: Optional[float]) -> str:
+    """Compact age: 12s, 4m, 3h, 2d."""
+    if seconds is None:
+        return "--"
+    seconds = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit}"
+    return f"{seconds}s"
 
 
 def _ints(v) -> List[int]:
@@ -657,7 +679,6 @@ class MeshTopApp:
 
         self.input_mode = False
         self.input_text = ""
-        self.input_target_num: Optional[int] = None
         self.trace_thread = None
         self.trace_lock = threading.RLock()
         self.data_lock = threading.RLock()
@@ -672,7 +693,11 @@ class MeshTopApp:
 
         # selection is tracked by node number so it doesn't jump when lists re-sort
         self.selected_node_num: Optional[int] = None
-        self.selected_chat_num: Optional[int] = None
+        self.selected_chat_key: Optional[tuple] = None  # ("ch", index) or ("dm", node_num)
+        self.input_target: Optional[tuple] = None
+        # unread tracking: messages loaded from the archive count as read
+        self.last_read: Dict[tuple, float] = {}
+        self.read_baseline = time.time()
 
         # connection supervision
         self.conn_state = "CONNECTING"
@@ -720,7 +745,7 @@ class MeshTopApp:
             pass
 
     def on_connection_lost(self, interface=None):
-        if interface is not None and interface is not self.iface:
+        if not self.running or (interface is not None and interface is not self.iface):
             return
         self.conn_state = "LOST"
         log.warning("connection to %s lost", self.host)
@@ -802,6 +827,11 @@ class MeshTopApp:
         # Pre-load nodeDB so we have names immediately
         for num, n in list((iface.nodesByNum or {}).items()):
             node = self._get_or_create_node(num)
+            if isinstance(n, dict):
+                node.db_last_heard = n.get("lastHeard") or node.db_last_heard
+                node.hops_away = n.get("hopsAway", node.hops_away)
+                if node.last_snr is None:
+                    node.last_snr = n.get("snr")
 
             # n may be protobuf or dict
             u = getattr(n, "user", None)
@@ -1079,6 +1109,8 @@ class MeshTopApp:
                     portnum=d.get("portnum", ""),
                     status=status,
                     pkt_id=packet.get("id"),
+                    channel=packet.get("channel", 0) or 0,
+                    broadcast=is_broadcast,
                 )
             )
 
@@ -1106,43 +1138,71 @@ class MeshTopApp:
 
     # ---------- Sending text ----------
 
-    def send_text_to_node(self, target_num: int, text: str):
-        with self.data_lock:
-            node = self.nodes.get(target_num)
-        to_id = (node.node_id if node and node.node_id else f"#{target_num}")
-        to_short = (node.short_name if node and node.short_name else "?")
+    def send_text(self, target: tuple, text: str):
+        """Send to a conversation: ("dm", node_num) or ("ch", channel_index)."""
+        kind, ident = target
+        broadcast = kind == "ch"
+        if broadcast:
+            dest, channel = BROADCAST_NUM, ident
+            to_id, to_short = "^all", self._channel_name(ident)
+        else:
+            with self.data_lock:
+                node = self.nodes.get(ident)
+            dest, channel = ident, 0
+            to_id = (node.node_id if node and node.node_id else f"#{ident}")
+            to_short = (node.short_name if node and node.short_name else "?")
         clean_text = safe_text(text)
         while len(clean_text.encode("utf-8")) > MAX_TEXT_BYTES:
             clean_text = clean_text[:-1]
 
-        def note(err_text):
-            with self.data_lock:
-                self.messages.append(MessageInfo(
-                    timestamp=time.time(), direction="OUT",
-                    from_id=self.local_id or "^local", from_short=self.local_short,
-                    to_id=to_id, to_short=to_short, text=err_text, status="UNKNOWN"))
+        msg = MessageInfo(
+            timestamp=time.time(), direction="OUT",
+            from_id=self.local_id or "^local", from_short=self.local_short,
+            to_id=to_id, to_short=to_short, text=clean_text, status="SENT",
+            channel=channel, broadcast=broadcast, ack="pending")
 
         iface = self.iface
         if iface is None or not iface.isConnected.is_set():
-            note(f"[NOT SENT – not connected] {clean_text}")
+            msg.status, msg.ack = "UNKNOWN", "failed: not connected"
+            with self.data_lock:
+                self.messages.append(msg)
             return
 
+        # The library only passes plain ACKs to a callback with this exact name.
+        def onAckNak(p, msg=msg, dest=dest):
+            err = ((p.get("decoded") or {}).get("routing") or {}).get("errorReason", "NONE")
+            if err != "NONE":
+                msg.ack = f"failed: {err}"
+            elif not msg.broadcast and p.get("from") == dest:
+                msg.ack = "delivered"  # the destination itself acknowledged
+            else:
+                msg.ack = "relayed"  # implicit ACK: a neighbour rebroadcast it
+                req = (p.get("decoded") or {}).get("requestId")
+                iface_now = self.iface
+                if not msg.broadcast and req is not None and iface_now is not None:
+                    # the library drops the handler after one call; keep waiting for the real ACK
+                    try:
+                        iface_now._addResponseHandler(req, onAckNak)
+                    except Exception:
+                        pass
+
         try:
-            pkt = iface.sendText(clean_text, destinationId=target_num, wantAck=True)
+            pkt = iface.sendText(clean_text, destinationId=dest, wantAck=True,
+                                 onResponse=onAckNak, channelIndex=channel)
+            msg.pkt_id = getattr(pkt, "id", None)
         except BaseException as e:
             # BaseException: the meshtastic library calls sys.exit() on some bad inputs,
             # which would otherwise close the whole app.
             if isinstance(e, KeyboardInterrupt):
                 raise
-            note(f"[SEND ERROR: {e or e.__class__.__name__}] {clean_text}")
+            msg.status, msg.ack = "UNKNOWN", f"failed: {e or e.__class__.__name__}"
+            with self.data_lock:
+                self.messages.append(msg)
             return
 
         with self.data_lock:
-            self.messages.append(MessageInfo(
-                timestamp=time.time(), direction="OUT",
-                from_id=self.local_id or "^local", from_short=self.local_short,
-                to_id=to_id, to_short=to_short, text=clean_text, status="SENT",
-                pkt_id=getattr(pkt, "id", None)))
+            self.messages.append(msg)
+        self.last_read[target] = time.time()
         try:
             self.archiver.write({
                 'ts_iso': MessageArchiver.now_iso(),
@@ -1151,18 +1211,89 @@ class MeshTopApp:
                 'from_name': self.local_short,
                 'to_id': to_id,
                 'to_name': to_short,
-                'broadcast': False,
+                'broadcast': broadcast,
                 'text': clean_text,
-                'msg_id': getattr(pkt, "id", None),
+                'msg_id': msg.pkt_id,
                 'ack': False,
                 'hop_limit': None,
                 'rssi': None,
                 'snr': None,
-                'channel': 0,
+                'channel': channel,
                 'errors': []
             })
         except Exception:
             pass
+
+    def send_text_to_node(self, target_num: int, text: str):
+        self.send_text(("dm", target_num), text)
+
+    # ---------- Conversations ----------
+
+    def _channel_name(self, index: int) -> str:
+        """Channel name from the radio config; the primary channel falls back to its modem preset."""
+        try:
+            local = self.iface.localNode
+            for ch in local.channels or []:
+                if ch.index == index and ch.settings.name:
+                    return ch.settings.name
+            if index == 0:
+                from meshtastic.protobuf import config_pb2
+                preset = config_pb2.Config.LoRaConfig.ModemPreset.Name(local.localConfig.lora.modem_preset)
+                return "".join(part.capitalize() for part in preset.split("_"))
+        except Exception:
+            pass
+        return "Primary" if index == 0 else f"Channel {index}"
+
+    def _conv_key(self, msg: MessageInfo) -> Optional[tuple]:
+        if msg.broadcast:
+            return ("ch", msg.channel)
+        num = _id_to_num(msg.to_id if msg.direction == "OUT" else msg.from_id)
+        if num is None or num == self.local_num:
+            return None
+        return ("dm", num)
+
+    def _conversations(self) -> List[dict]:
+        """Channels first (the primary channel always), then direct chats, newest first."""
+        with self.data_lock:
+            messages = list(self.messages)
+        convs: Dict[tuple, dict] = {("ch", 0): {"key": ("ch", 0), "last_ts": 0.0, "unread": 0}}
+        for msg in messages:
+            key = self._conv_key(msg)
+            if key is None:
+                continue
+            c = convs.setdefault(key, {"key": key, "last_ts": 0.0, "unread": 0})
+            c["last_ts"] = max(c["last_ts"], msg.timestamp)
+            if msg.direction == "IN" and msg.timestamp > max(self.read_baseline, self.last_read.get(key, 0)):
+                c["unread"] += 1
+        chans = sorted((c for k, c in convs.items() if k[0] == "ch"), key=lambda c: c["key"][1])
+        dms = sorted((c for k, c in convs.items() if k[0] == "dm"), key=lambda c: -c["last_ts"])
+        return chans + dms
+
+    def _conv_label(self, key: tuple) -> str:
+        if key[0] == "ch":
+            return "# " + self._channel_name(key[1])
+        n = self.nodes.get(key[1])
+        if not n:
+            return f"#{key[1]}"
+        name = n.short_name if n.short_name and n.short_name != "?" else (n.node_id or f"#{n.num}")
+        if n.long_name and n.long_name not in ("?", name):
+            name = f"{name} {n.long_name}"
+        return name
+
+    def _unread_total(self) -> int:
+        return sum(c["unread"] for c in self._conversations())
+
+    @staticmethod
+    def _ack_mark(msg: MessageInfo) -> str:
+        if msg.direction != "OUT" or not msg.ack:
+            return ""
+        if msg.ack == "pending":
+            return " …"
+        if msg.ack == "relayed":
+            return " ✓"
+        if msg.ack == "delivered":
+            return " ✓✓"
+        return f" ✗ {msg.ack.removeprefix('failed: ')}"
 
     # ---------- Drawing helpers ----------
 
@@ -1173,6 +1304,9 @@ class MeshTopApp:
         maxw = w - 1
         if getattr(self, "auto_trace_in_progress", False) and getattr(self, "auto_trace_active_node", None):
             text += f" | [Auto-tracing: {self.auto_trace_active_node}]"
+        unread = self._unread_total()
+        if unread:
+            text = f"✉ {unread} unread | " + text
         attr = curses.A_REVERSE
         if self.conn_state != "CONNECTED":
             state = self.conn_state + (f": {self.conn_error}" if self.conn_error else "")
@@ -1182,55 +1316,35 @@ class MeshTopApp:
             text += f" | UI error: {self.ui_error} (see meshtop.log)"
         stdscr.addnstr(0, 0, ljust_cells(safe_text(text), maxw), maxw, attr)
 
+    def _msg_line(self, msg: MessageInfo, with_where: bool) -> str:
+        """One-line summary of a message for the nodes-view log."""
+        t_str = time.strftime("%H:%M", time.localtime(msg.timestamp))
+        sender = "Me" if msg.direction == "OUT" else (msg.from_short or msg.from_id)
+        if msg.broadcast:
+            where = f"#{self._channel_name(msg.channel)} "
+        elif msg.direction == "OUT":
+            where = f"→{msg.to_short} "
+        else:
+            where = "→Me " if with_where else ""
+        return f"{t_str} {where}{sender}: {safe_text(msg.text)}{self._ack_mark(msg)}"
+
     def _draw_message_log(self, stdscr, start_row: int, max_rows: int):
+        """Latest messages, newest first, under the nodes table. Unread ones are bold."""
         h, w = stdscr.getmaxyx()
         maxw = w - 1
-        if start_row >= h - 1 or maxw <= 0:
-            return
-
         with self.data_lock:
-            msgs_copy = list(self.messages[-max_rows:])
-
-        if not msgs_copy:
-            stdscr.addnstr(start_row, 0, "(no messages yet)".ljust(maxw), maxw)
+            msgs = list(reversed(self.messages[-max_rows:]))
+        if not msgs:
+            stdscr.addnstr(start_row, 0, "(no messages yet)", maxw, curses.A_DIM)
             return
-
-        msgs = list(reversed(msgs_copy))
         for i, msg in enumerate(msgs):
-            row_y = start_row + i
-            if row_y >= h - 1:
-                break
-            t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
-            dir_str = ">" if msg.direction == "OUT" else "<"
-            from_str = f"{msg.from_id[-4:]}({msg.from_short})"
-            to_str = f"{msg.to_id[-4:]}({msg.to_short})"
-            status = msg.status
-            prefix = f"{t_str} {dir_str} {from_str}->{to_str} [{status}] "
-            text_space = max(10, maxw - len(prefix) - 1)
-            text = safe_text(msg.text)[:text_space]
-
-            # build the rendered line
-            line = (prefix + text).ljust(maxw)
-
-            # highlight "to me" rows using the SAME mechanism as NODES (pair 3)
-            # highlight ONLY messages explicitly sent TO *my* node
-            attrs = 0
-            to_me = False
-            if (msg.direction or "").upper() == "IN":  # must be inbound
-                norm_to = _norm(msg.to_id)
-                if (self.local_id and norm_to == _norm(self.local_id)) \
-                        or (self.local_num is not None and norm_to == str(self.local_num)) \
-                        or ((msg.to_short or "") and (self.local_short or "") and msg.to_short == self.local_short):
-                    to_me = True
-
-            # only color in the full MESSAGES window; reuse pair(3) that already works in NODES
-            if self.view_mode == "MSGS" and to_me and curses.has_colors():
-                attrs |= curses.color_pair(3) | curses.A_BOLD
-
-            # IMPORTANT: pass attrs as the 5th argument
-            stdscr.addnstr(row_y, 0, line, maxw, attrs)
-
-
+            key = self._conv_key(msg)
+            unread = (msg.direction == "IN" and key is not None
+                      and msg.timestamp > max(self.read_baseline, self.last_read.get(key, 0)))
+            attrs = curses.A_BOLD if unread else 0
+            if msg.direction == "IN" and not msg.broadcast:
+                attrs |= curses.color_pair(5)  # direct message to me
+            stdscr.addnstr(start_row + i, 0, ljust_cells(self._msg_line(msg, True), maxw), maxw, attrs)
 
     def _draw_trace_view(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1358,204 +1472,260 @@ class MeshTopApp:
 
         stdscr.addnstr(h - 1, 0, "[t] retry  [n] nodes  [m] messages  [s] stats  [q] quit".ljust(maxw), maxw)
 
+    # ---------- Nodes view ----------
+
+    def _heard_at(self, n: NodeInfo) -> float:
+        """Last time we know the node was heard: live, or from the radio's node DB."""
+        return max(n.last_seen or 0, n.db_last_heard or 0)
+
+    def _hops(self, n: NodeInfo) -> Optional[int]:
+        if n.hop_start is not None and n.hop_limit is not None:
+            return n.hop_start - n.hop_limit
+        return n.hops_away
+
+    @staticmethod
+    def _snr_attr(snr) -> int:
+        if snr is None:
+            return 0
+        if snr >= 0:
+            return curses.color_pair(2)
+        if snr >= -10:
+            return curses.color_pair(3)
+        return curses.color_pair(1)
+
+    def _route_text(self, node: NodeInfo) -> Optional[str]:
+        """'ME ─(+7.8)→ MMA ─(+3.0)→ FKAT' for the last trace, or None if never traced."""
+        if node.last_route is None:
+            return None
+        hops = [h for h in node.last_route if h not in (node.num, self.local_num)]
+        full = [self.local_num] + hops + [node.num]
+        snrs = node.last_route_snr_towards or []
+        out = self._node_label(full[0]) if self.local_num is not None else "ME"
+        for i, num in enumerate(full[1:]):
+            v = snrs[i] if i < len(snrs) else None
+            out += f" ─({v / 4.0:+.1f})→ " if v not in (None, -128) else " → "
+            out += self._node_label(num)
+        return out
+
+    def _return_route_text(self, node: NodeInfo) -> Optional[str]:
+        back = node.last_route_back or []
+        if not back or list(reversed(back)) == list(node.last_route or []):
+            return None
+        full = [node.num] + back + [self.local_num]
+        snrs = node.last_route_snr_back or []
+        out = self._node_label(full[0])
+        for i, num in enumerate(full[1:]):
+            v = snrs[i] if i < len(snrs) else None
+            out += f" ─({v / 4.0:+.1f})→ " if v not in (None, -128) else " → "
+            out += self._node_label(num)
+        return out
+
+    def _node_detail(self, node: NodeInfo, width: int, compact: bool) -> List[tuple]:
+        """Lines of (text, attr) describing the selected node."""
+        now = time.time()
+        title = node.short_name or "?"
+        if node.long_name and node.long_name not in ("?", title):
+            title += f" – {node.long_name}"
+        ident = " · ".join(x for x in (node.node_id or f"#{node.num}", str(node.hw_model or "")) if x and x != "?")
+        heard = self._heard_at(node)
+        hops = self._hops(node)
+        radio = [] if node.is_me else [f"heard {fmt_ago(now - heard)} ago" if heard else "never heard"]
+        if node.last_snr is not None:
+            radio.append(f"SNR {node.last_snr:+.1f} dB")
+        if node.last_rssi is not None:
+            radio.append(f"RSSI {int(node.last_rssi)}")
+        if hops is not None:
+            radio.append("direct" if hops == 0 else f"{hops} hop{'s' if hops != 1 else ''}")
+        if node.seen_packets:
+            radio.append(f"{node.seen_packets} pkts")
+        power = []
+        if node.battery is not None:
+            power.append("powered" if node.battery > 100 else f"bat {node.battery}%")
+        if node.voltage:
+            power.append(f"{node.voltage:.2f}V")
+        if node.channel_util is not None:
+            power.append(f"ChU {node.channel_util:.1f}%")
+        if node.air_util is not None:
+            power.append(f"Air {node.air_util:.2f}%")
+        env = []
+        if node.temperature is not None:
+            env.append(f"{node.temperature:.1f}°C")
+        if node.humidity is not None:
+            env.append(f"{node.humidity:.0f}% RH")
+        pos = ""
+        if node.lat is not None and node.lon is not None and (node.lat, node.lon) != (0.0, 0.0):
+            pos = f"{node.lat:.5f}, {node.lon:.5f}"
+            if node.distance_km is not None and not node.is_me:
+                pos += f" · {node.distance_km:.1f} km"
+        route = self._route_text(node)
+        if node.is_me:
+            route_line = "This is your node"
+        elif route:
+            ago = f" ({fmt_ago(now - node.last_route_time)} ago)" if node.last_route_time else ""
+            route_line = f"Trace{ago}: {route}"
+        else:
+            route_line = "No trace yet – press t"
+        router_for = self._router_counts().get(node.num, 0)
+
+        bold = curses.A_BOLD | (curses.color_pair(3) if node.is_me else 0)
+        dim = curses.A_DIM
+        if compact:
+            line2 = " · ".join(radio + power + env + ([pos] if pos else []))
+            return [(f"{title}  ({ident})", bold), (line2, 0), (route_line, dim if not route else 0)]
+
+        lines = [(title, bold), (ident, dim), ("", 0), (" · ".join(radio), 0)]
+        if power:
+            lines.append((" · ".join(power), curses.color_pair(1) if node.battery_low else 0))
+        if env:
+            lines.append((" · ".join(env), 0))
+        if pos:
+            lines.append((pos, 0))
+        if router_for:
+            lines.append((f"Relay for {router_for} traced node{'s' if router_for != 1 else ''}", curses.color_pair(2)))
+        lines.append(("", 0))
+        if route:
+            ago = f" ({fmt_ago(now - node.last_route_time)} ago)" if node.last_route_time else ""
+            lines.append((f"Trace{ago}:", curses.A_BOLD))
+            lines += [(l, 0) for l in wrap_cells(route, width)]
+            back = self._return_route_text(node)
+            if back:
+                lines.append(("Return path:", curses.A_BOLD))
+                lines += [(l, 0) for l in wrap_cells(back, width)]
+        else:
+            lines.append((route_line, dim))
+        lines += [("", 0), ("[Enter] message  [t] trace", dim)]
+        out = []
+        for text, attr in lines:
+            wrapped = wrap_cells(text, width) if text else [""]
+            out += [(l, attr) for l in wrapped]
+        return out
+
     def _draw_nodes_view(self, stdscr):
         h, w = stdscr.getmaxyx()
         if h < 8 or w < 40:
             return
         self._wipe_body(stdscr)
-
         maxw = w - 1
         top = 1
-        rows_avail = h - 7  # leave space for log + footer + route info
+        now = time.time()
+
+        # Wide terminals: detail pane on the right; narrow: 3 detail rows at the bottom
+        wide = w >= 130
+        if wide:
+            pane_w = min(50, w // 3)
+            table_w = maxw - pane_w - 1
+            log_rows = 2
+            table_bottom = h - 2 - log_rows  # last row the table may use
+        else:
+            pane_w = 0
+            table_w = maxw
+            log_rows = 1
+            table_bottom = h - 2 - log_rows - 3
+        rows_avail = max(1, table_bottom - top)  # rows below the header row
 
         nodes_list = self._sorted_nodes()
-
-        # 1. Follow the selected node through re-sorts, and keep the index in bounds
         self._sync_node_selection(nodes_list)
 
-        # 2. SCROLL LOGIC: Adjust offset to keep the selected node visible
+        # keep the selected node visible
         if self.selected_node_index < self.node_view_offset:
             self.node_view_offset = self.selected_node_index
         elif self.selected_node_index >= self.node_view_offset + rows_avail:
             self.node_view_offset = self.selected_node_index - rows_avail + 1
+        self.node_view_offset = max(0, min(self.node_view_offset, max(0, len(nodes_list) - rows_avail)))
 
-        # 3. Clamp the offset
-        if len(nodes_list) <= rows_avail:
-            self.node_view_offset = 0
-        else:
-            max_offset = len(nodes_list) - rows_avail
-            if self.node_view_offset > max_offset:
-                self.node_view_offset = max_offset
+        # Column layout: Name and Route share whatever width is left
+        fixed = [("Heard", 5), ("SNR", 5), ("Hop", 3), ("Bat", 4), ("ChU%", 4), ("Dist", 6)]
+        rest = table_w - 2 - sum(wd for _, wd in fixed) - len(fixed) - 1  # 2 = selection marker
+        name_w = max(12, min(30, int(rest * 0.55)))
+        route_w = rest - name_w - 1
+        cols = [("Name", name_w)] + fixed[:5] + ([("Route", route_w)] if route_w >= 6 else []) + fixed[5:]
+        if route_w < 6:
+            cols[0] = ("Name", rest)
 
-        cols = [
-            ("ID", 11),
-            ("Short", 8),
-            ("Long", 18),
-            ("HW", 10),
-            ("Seen", 6),
-            ("RSSI", 6),
-            ("SNR", 5),
-            ("Hop", 5),
-            ("Route", 12),
-            ("Bat%", 6),
-            ("V", 5),
-            ("ChU%", 6),
-            ("AirTx%", 7),
-            ("Temp", 6),
-            ("Hum%", 6),
-            ("Dist", 7),
-        ]
-
-        total_min = sum(wd for _, wd in cols) + len(cols) - 1
-        extra = maxw - total_min
-        if extra < 0:
-            for i, (name, wd) in enumerate(cols):
-                if name == "Long":
-                    cols[i] = (name, max(8, wd + extra))
-                    break
-
-        x = 0
+        x = 2
         for name, wd in cols:
-            if x >= maxw:
-                break
-            stdscr.addnstr(top, x, name.ljust(wd), min(wd, maxw - x), curses.A_BOLD)
+            stdscr.addnstr(top, x, name, min(wd, table_w - x), curses.A_BOLD | curses.A_UNDERLINE)
             x += wd + 1
 
         routers = self._router_nums()
-
-        # Slice the list based on offset
-        visible_nodes = nodes_list[self.node_view_offset:self.node_view_offset + rows_avail]
-
-        for i, node in enumerate(visible_nodes):
+        for i, node in enumerate(nodes_list[self.node_view_offset:self.node_view_offset + rows_avail]):
             row_y = top + 1 + i
-            if row_y >= h - 5:
-                break
+            selected = self.node_view_offset + i == self.selected_node_index
+            heard = self._heard_at(node)
+            age = now - heard if heard else None
 
-            # The 'real' index in the full list
-            real_index = self.node_view_offset + i
-
-            attrs = 0
-            if real_index == self.selected_node_index:
-                attrs |= curses.A_REVERSE
-            # one color per row (OR-ing color pairs together gives a random third color)
-            if node.battery_low:
-                attrs |= curses.color_pair(1)
-            elif node.is_me:
-                attrs |= curses.color_pair(3)
+            base = 0
+            if node.is_me:
+                base = curses.color_pair(3) | curses.A_BOLD
             elif node.num in routers:
-                attrs |= curses.color_pair(2)
+                base = curses.color_pair(2)
+            if age is None or age > 7200:
+                base |= curses.A_DIM  # stale: not heard for 2 hours
+            if selected:
+                base |= curses.A_REVERSE
 
-            id_str = node.node_id or f"#{node.num}"
-            if len(id_str) > 11:
-                id_str = id_str[-11:]
-
-            seen_str = f"{node.seen_packets:>4}"
-            rssi_str = f"{int(node.last_rssi):>4}" if node.last_rssi is not None else "   -"
-            snr_str = f"{int(node.last_snr):>3}" if node.last_snr is not None else " --"
-            hop_str = "--"
-            if node.hop_limit is not None and node.hop_start is not None:
-                hop_str = f"{node.hop_start - node.hop_limit:>2}"
-
-            route_str = "--"
-            if getattr(node, "last_route", None) is not None:
-                if len(node.last_route) == 0:
-                    route_str = "DIRECT"
-                else:
-                    route_str = ">".join(self._node_label(n) for n in node.last_route)
-
-            bat_str = f"{node.battery:>3}%" if node.battery is not None else " --%"
-            v_str = f"{node.voltage:.2f}" if node.voltage is not None else " -- "
-            chu_str = f"{node.channel_util:4.1f}" if node.channel_util is not None else " -- "
-            airtx_str = f"{node.air_util:4.2f}" if node.air_util is not None else " -- "
-            temp_str = f"{node.temperature:4.1f}" if node.temperature is not None else " -- "
-            hum_str = f"{node.humidity:4.1f}" if node.humidity is not None else " -- "
-            dist_str = f"{node.distance_km:5.1f}k" if node.distance_km is not None else "  --  "
-
-            data = [
-                id_str,
-                node.short_name,
-                node.long_name,
-                node.hw_model,
-                seen_str,
-                rssi_str,
-                snr_str,
-                hop_str,
-                route_str,
-                bat_str,
-                v_str,
-                chu_str,
-                airtx_str,
-                temp_str,
-                hum_str,
-                dist_str,
-            ]
-
-            x = 0
-            for (name, wd), val in zip(cols, data):
-                if x >= maxw:
-                    break
-                cell = ljust_cells(safe_text(str(val)), wd)
-                stdscr.addnstr(row_y, x, cell + " ", min(wd + 1, maxw - x), attrs)
+            name = node.short_name or "?"
+            if node.long_name and node.long_name not in ("?", name):
+                name += " " + node.long_name
+            hops = self._hops(node)
+            if node.last_route is None:
+                route_str = "--"
+            elif not node.last_route:
+                route_str = "DIRECT"
+            else:
+                route_str = ">".join(self._node_label(n) for n in node.last_route)
+            bat = node.battery
+            cells = {
+                "Name": (name, 0),
+                "Heard": ("me" if node.is_me else fmt_ago(age) if age is not None else "never", 0),
+                "SNR": (f"{node.last_snr:+.1f}" if node.last_snr is not None else "--",
+                        self._snr_attr(node.last_snr) if not node.is_me else 0),
+                "Hop": (str(hops) if hops is not None else "--", 0),
+                "Bat": ("--" if bat is None else "PWR" if bat > 100 else f"{bat}%",
+                        curses.color_pair(1) | curses.A_BOLD if node.battery_low else 0),
+                "ChU%": (f"{node.channel_util:.1f}" if node.channel_util is not None else "--", 0),
+                "Route": (route_str, 0),
+                "Dist": (f"{node.distance_km:.1f}k" if node.distance_km is not None and not node.is_me else "--", 0),
+            }
+            stdscr.addnstr(row_y, 0, ("▶ " if selected else "  "), 2, base)
+            x = 2
+            for col, wd in cols:
+                text, color = cells[col]
+                attr = base
+                if color and not selected:
+                    attr = (base & ~curses.A_COLOR) | color
+                right = col not in ("Name", "Route")
+                cell = text.rjust(wd) if right and text_width(text) < wd else ljust_cells(text, wd)
+                stdscr.addnstr(row_y, x, cell + " ", min(wd + 1, table_w - x), attr)
                 x += wd + 1
 
-        topo_row = h - 5
-        if self.local_lat is None or self.local_lon is None:
-            msg = "(my position unknown – Dist will stay --)"
-        else:
-            msg = f"My position: {self.local_lat:.5f}, {self.local_lon:.5f}"
-        stdscr.addnstr(topo_row, 0, msg.ljust(maxw), maxw)
+        if len(nodes_list) > rows_avail:
+            more = f" {self.node_view_offset + 1}-{min(len(nodes_list), self.node_view_offset + rows_avail)}/{len(nodes_list)} "
+            stdscr.addnstr(table_bottom, max(0, table_w - len(more)), more, len(more), curses.A_DIM)
 
-        route_info_row = h - 4
         selected_node = nodes_list[self.selected_node_index] if nodes_list else None
-        if selected_node and getattr(selected_node, "last_route", None) is not None:
-            hops_names = [self._node_label(n) for n in selected_node.last_route]
-            route_path = " -> ".join(hops_names)
-            if not route_path:
-                route_path = "DIRECT"
+        if wide:
+            for y in range(top, h - 1 - log_rows):
+                stdscr.addch(y, table_w, curses.ACS_VLINE)
+            if selected_node:
+                for i, (text, attr) in enumerate(self._node_detail(selected_node, pane_w - 1, compact=False)):
+                    if top + i >= h - 1 - log_rows:
+                        break
+                    stdscr.addnstr(top + i, table_w + 2, text, pane_w - 1, attr)
+        elif selected_node:
+            y0 = table_bottom + 1
+            for i, (text, attr) in enumerate(self._node_detail(selected_node, maxw, compact=True)):
+                stdscr.addnstr(y0 + i, 0, ljust_cells(text, maxw), maxw, attr)
 
-            snr_fwd = getattr(selected_node, "last_route_snr_towards", []) or []
-            snr_back = getattr(selected_node, "last_route_snr_back", []) or []
-            snr_str = ""
+        self._draw_message_log(stdscr, start_row=h - 1 - log_rows, max_rows=log_rows)
 
-            def format_snrs(vals):
-                formatted = []
-                for val in vals:
-                    if val is not None and val != -128:
-                        formatted.append(f"{val/4.0:+.1f}dB")
-                    else:
-                        formatted.append("?dB")
-                return ", ".join(formatted)
-
-            if snr_fwd:
-                snr_str += f" (fwd: {format_snrs(snr_fwd)}"
-            if snr_back:
-                if snr_str:
-                    snr_str += f" | back: {format_snrs(snr_back)})"
-                else:
-                    snr_str += f" (back: {format_snrs(snr_back)})"
-            else:
-                if snr_str:
-                    snr_str += ")"
-
-            ts_str = ""
-            if getattr(selected_node, "last_route_time", None):
-                ago = int(time.time() - selected_node.last_route_time)
-                ts_str = f" [{ago}s ago]"
-
-            route_msg = f"Last Route to {selected_node.short_name or selected_node.node_id}: {route_path}{snr_str}{ts_str}"
-        else:
-            route_msg = "Last Route: (no trace route recorded yet for selected node)"
-        stdscr.addnstr(route_info_row, 0, route_msg.ljust(maxw), maxw)
-
-        self._draw_message_log(stdscr, start_row=h - 3, max_rows=2)
-
-        footer = "[↑↓] select node  [Enter] send  [t] trace  [m] msgs  [s] stats  [p] export  [q] quit"
-        stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
+        footer = "[↑↓] select  [Enter] message  [t] trace  [m] messages  [s] stats  [p] export  [q] quit"
+        stdscr.addnstr(h - 1, 0, ljust_cells(footer, maxw), maxw, curses.A_DIM)
 
     def _sorted_nodes(self) -> List[NodeInfo]:
         with self.data_lock:
             nodes_list = list(self.nodes.values())
-        nodes_list.sort(key=lambda n: (not n.is_me, -(n.last_seen or 0)))
+        nodes_list.sort(key=lambda n: (not n.is_me, -self._heard_at(n)))
         return nodes_list
 
     def _sync_node_selection(self, nodes_list: List[NodeInfo]):
@@ -1566,29 +1736,7 @@ class MeshTopApp:
             self.selected_node_index = max(0, min(self.selected_node_index, len(nums) - 1))
             self.selected_node_num = nums[self.selected_node_index] if nums else None
 
-    def _get_chat_partners(self):
-        with self.data_lock:
-            all_nodes = [node for node in self.nodes.values() if not node.is_me and node.num != self.local_num]
-            messages = list(self.messages)
-
-        id_to_node = {}
-        for n in all_nodes:
-            nid = _norm(n.node_id)
-            if nid:
-                id_to_node[nid] = n
-            id_to_node[str(n.num)] = n
-
-        last_msg_ts = {}
-        for msg in messages:
-            f = _norm(msg.from_id)
-            t = _norm(msg.to_id)
-            partner = id_to_node.get(f) or id_to_node.get(t)
-            if partner:
-                last_msg_ts[partner.num] = max(last_msg_ts.get(partner.num, 0), msg.timestamp)
-
-        active_partners = [n for n in all_nodes if n.num in last_msg_ts]
-        active_partners.sort(key=lambda n: -last_msg_ts[n.num])
-        return active_partners
+    # ---------- Messages view ----------
 
     def _draw_messages_view(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1598,116 +1746,123 @@ class MeshTopApp:
         top = 1
         self._wipe_body(stdscr)
 
-        chat_partners = self._get_chat_partners()
+        convs = self._conversations()
+        self._sync_chat_selection(convs)
+        active = convs[self.selected_chat_index]
+        key = active["key"]
 
-        if not chat_partners:
-            stdscr.addnstr(
-                top,
-                0,
-                "(no active conversations yet – start one by pressing Enter in NODES view)".ljust(maxw),
-                maxw,
-            )
-            footer = "[n] nodes view  [s] stats view  [q] quit"
-            stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
-            return
+        left_w = max(18, min(28, w // 4))
+        right_x = left_w + 2
+        right_w = maxw - right_x
 
-        self._sync_chat_selection(chat_partners)
-        active_partner = chat_partners[self.selected_chat_index]
-
-        # Split layout columns
-        left_w = 22
-        right_x = 24
-
-        # --- Draw Left Column: Conversations List ---
-        for idx, partner in enumerate(chat_partners):
-            row_y = top + idx
-            if row_y >= h - 1:
+        # --- Left column: channels, then direct chats ---
+        y = top
+        prev_kind = None
+        for idx, c in enumerate(convs):
+            if y >= h - 2:
                 break
+            if c["key"][0] != prev_kind:
+                header = "CHANNELS" if c["key"][0] == "ch" else "DIRECT"
+                if prev_kind is not None:
+                    y += 1
+                stdscr.addnstr(y, 0, header, left_w, curses.A_DIM | curses.A_BOLD)
+                y += 1
+                prev_kind = c["key"][0]
+            badge = f" ({c['unread']})" if c["unread"] else ""
+            label = clip_cells(self._conv_label(c["key"]), left_w - text_width(badge) - 1)
+            attrs = curses.A_REVERSE if idx == self.selected_chat_index else 0
+            if c["unread"]:
+                attrs |= curses.A_BOLD
+            stdscr.addnstr(y, 0, ljust_cells(" " + label + badge, left_w), left_w, attrs)
+            y += 1
 
-            name = partner.short_name or partner.node_id or f"#{partner.num}"
-            if partner.long_name and partner.long_name != "?" and partner.long_name != name:
-                name = f"{name} {partner.long_name}"
-            if text_width(name) > left_w:
-                name = clip_cells(name, left_w - 1) + "…"
+        for yy in range(top, h - 1):
+            stdscr.addch(yy, left_w + 1, curses.ACS_VLINE)
 
-            attrs = curses.A_NORMAL
-            if idx == self.selected_chat_index:
-                attrs |= curses.A_REVERSE
-
-            stdscr.addnstr(row_y, 0, ljust_cells(name, left_w), left_w, attrs)
-
-        # Draw vertical separator line
-        if left_w + 1 < w:
-            for y in range(top, h - 1):
-                try:
-                    stdscr.addch(y, left_w + 1, curses.ACS_VLINE)
-                except curses.error:
-                    pass
-            
-        # --- Draw Right Column: Active Conversation Messages ---
-        with self.data_lock:
-            chat_msgs = [
-                msg for msg in self.messages
-                if _msg_involves_node(msg, active_partner, self.local_id, self.local_num)
-            ]
-            
-        right_w = w - right_x - 1
-        msg_rows_avail = h - 3  # rows 1..h-3; h-2 is the input line, h-1 the footer
-
-        if not chat_msgs:
-            stdscr.addnstr(top, right_x, "(no messages in this conversation yet)", right_w)
+        # --- Right column: title, then the conversation ---
+        if key[0] == "ch":
+            title = f"# {self._channel_name(key[1])} – public channel, everyone on it can read"
         else:
-            partner_name = active_partner.short_name or active_partner.node_id or f"#{active_partner.num}"
-            # Wrap every message (continuation lines indented), then show the newest rows
+            n = self.nodes.get(key[1])
+            title = f"@ {self._conv_label(key)}"
+            if n:
+                heard = self._heard_at(n)
+                hops = self._hops(n)
+                bits = [n.node_id or f"#{n.num}"]
+                if heard:
+                    bits.append(f"heard {fmt_ago(time.time() - heard)} ago")
+                if hops is not None:
+                    bits.append("direct" if hops == 0 else f"{hops} hops")
+                title += "  (" + " · ".join(bits) + ")"
+        stdscr.addnstr(top, right_x, title, right_w, curses.A_BOLD)
+
+        with self.data_lock:
+            chat_msgs = [m for m in self.messages if self._conv_key(m) == key]
+
+        first_row = top + 2
+        msg_rows_avail = (h - 3) - first_row + 1  # h-2 is the input line, h-1 the footer
+        if not chat_msgs:
+            hint = "(no messages yet – press Enter to write)"
+            stdscr.addnstr(first_row, right_x, hint, right_w, curses.A_DIM)
+        else:
             rendered = []
+            prev_day = None
             for msg in chat_msgs[-msg_rows_avail:]:
-                t_str = time.strftime("%H:%M:%S", time.localtime(msg.timestamp))
+                day = time.strftime("%a %d %b", time.localtime(msg.timestamp))
+                if day != prev_day:
+                    rendered.append((f"── {day} ──", curses.A_DIM))
+                    prev_day = day
+                t_str = time.strftime("%H:%M", time.localtime(msg.timestamp))
                 if msg.direction == "OUT":
-                    sender, attrs = "Me", curses.color_pair(3)  # Yellow
+                    sender, attrs = "Me", curses.color_pair(3)
                 else:
-                    sender, attrs = partner_name, curses.color_pair(5)  # Cyan
-                if msg.status == "UNKNOWN":
-                    attrs = curses.color_pair(1)  # send errors in red
-                prefix = f"[{t_str}] {sender}: "
+                    sender, attrs = (msg.from_short or msg.from_id), curses.color_pair(5)
+                if msg.ack.startswith("failed"):
+                    attrs = curses.color_pair(1)
+                prefix = f"{t_str} {sender}: "
                 indent = min(text_width(prefix), right_w // 3)
-                lines = wrap_cells(prefix + safe_text(msg.text), max(5, right_w - indent))
+                lines = wrap_cells(prefix + safe_text(msg.text) + self._ack_mark(msg), max(5, right_w - indent))
                 rendered.append((lines[0], attrs))
                 rendered.extend((" " * indent + line, attrs) for line in lines[1:])
             for idx, (line, attrs) in enumerate(rendered[-msg_rows_avail:]):
-                stdscr.addnstr(top + idx, right_x, line, right_w, attrs)
+                stdscr.addnstr(first_row + idx, right_x, line, right_w, attrs)
 
-        # Footer
-        footer = "[↑↓] select chat  [Enter] write  [n] nodes view  [s] stats view  [q] quit"
-        stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
+        # Looking at a conversation marks it read
+        if not self.input_mode or self.input_target == key:
+            self.last_read[key] = time.time()
+
+        target = "channel" if key[0] == "ch" else "chat"
+        footer = f"[↑↓] select  [Enter] write to {target}  [n] nodes  [s] stats  [q] quit   ✓ relayed  ✓✓ delivered"
+        stdscr.addnstr(h - 1, 0, ljust_cells(footer, maxw), maxw, curses.A_DIM)
+
+    def _sync_chat_selection(self, convs: List[dict]):
+        keys = [c["key"] for c in convs]
+        if self.selected_chat_key in keys:
+            self.selected_chat_index = keys.index(self.selected_chat_key)
+        else:
+            self.selected_chat_index = max(0, min(self.selected_chat_index, len(keys) - 1))
+            self.selected_chat_key = keys[self.selected_chat_index]
 
     # ---------- Input handling ----------
 
-    def _sync_chat_selection(self, chat_partners: List[NodeInfo]):
-        nums = [n.num for n in chat_partners]
-        if self.selected_chat_num in nums:
-            self.selected_chat_index = nums.index(self.selected_chat_num)
-        else:
-            self.selected_chat_index = max(0, min(self.selected_chat_index, len(nums) - 1))
-            self.selected_chat_num = nums[self.selected_chat_index] if nums else None
-
-    def _start_input(self, target_num: int):
+    def _start_input(self, target: tuple):
         self.input_mode = True
         self.input_text = ""
-        self.input_target_num = target_num
+        self.input_target = target
 
     def _handle_input_char(self, ch):
         """ch is a str (typed character, any language) or an int (special key)."""
         if ch in (curses.KEY_ENTER, "\n", "\r"):
-            if self.input_target_num is not None and self.input_text.strip():
-                self.send_text_to_node(self.input_target_num, self.input_text.strip())
+            if self.input_target is not None and self.input_text.strip():
+                self.send_text(self.input_target, self.input_text.strip())
             self.input_mode = False
             self.input_text = ""
-            self.input_target_num = None
+            self.input_target = None
             return
         if ch == "\x1b":  # ESC
             self.input_mode = False
             self.input_text = ""
-            self.input_target_num = None
+            self.input_target = None
             return
         if ch in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
             self.input_text = self.input_text[:-1]
@@ -1732,9 +1887,8 @@ class MeshTopApp:
                 self.selected_node_index = max(0, min(len(nodes_list) - 1, self.selected_node_index + step))
                 self.selected_node_num = nodes_list[self.selected_node_index].num
         elif ch in (curses.KEY_ENTER, 10, 13):
-            if nodes_list:
-                target = nodes_list[self.selected_node_index]
-                self._start_input(target.num)
+            if nodes_list and not nodes_list[self.selected_node_index].is_me:
+                self._start_input(("dm", nodes_list[self.selected_node_index].num))
         elif ch in (ord('t'), ord('T')):
             if nodes_list:
                 target = nodes_list[self.selected_node_index]
@@ -1744,18 +1898,14 @@ class MeshTopApp:
                 self._send_trace_to_current()
 
     def _handle_msgs_keys(self, ch):
-        chat_partners = self._get_chat_partners()
-        if not chat_partners:
-            return
-        self._sync_chat_selection(chat_partners)
-
+        convs = self._conversations()
+        self._sync_chat_selection(convs)
         if ch in (curses.KEY_UP, curses.KEY_DOWN):
             step = -1 if ch == curses.KEY_UP else 1
-            self.selected_chat_index = max(0, min(len(chat_partners) - 1, self.selected_chat_index + step))
-            self.selected_chat_num = chat_partners[self.selected_chat_index].num
+            self.selected_chat_index = max(0, min(len(convs) - 1, self.selected_chat_index + step))
+            self.selected_chat_key = convs[self.selected_chat_index]["key"]
         elif ch in (10, 13, curses.KEY_ENTER):
-            partner = chat_partners[self.selected_chat_index]
-            self._start_input(partner.num)
+            self._start_input(convs[self.selected_chat_index]["key"])
 
     def _handle_stats_keys(self, ch):
         if ch in (curses.KEY_UP, ord('k'), ord('K')):
@@ -1837,7 +1987,9 @@ class MeshTopApp:
                 text=safe_text(text),
                 portnum="TEXT_MESSAGE_APP",
                 status="RECEIVED" if direction == "IN" else "SENT",
-                pkt_id=rec.get("msg_id")
+                pkt_id=rec.get("msg_id"),
+                channel=rec.get("channel") or 0,
+                broadcast=bool(rec.get("broadcast")) or to_id in BROADCAST_IDS,
             )
             self.messages.append(msg)
 
@@ -2000,7 +2152,7 @@ class MeshTopApp:
 
         if self.input_mode:
             maxw = w - 1
-            to = self._node_label(self.input_target_num)
+            to = self._conv_label(self.input_target) if self.input_target else "?"
             used = len(self.input_text.encode("utf-8"))
             prompt = f"To {to} [{used}/{MAX_TEXT_BYTES}] (Enter=send, Esc=cancel): "
             txt = safe_text(self.input_text)
@@ -2112,8 +2264,9 @@ class MeshTopApp:
         for n in nodes_list:
             if n.is_me:
                 continue
-            if n.last_seen and n.last_seen > 0:
-                if now - n.last_seen < 1800:
+            heard = self._heard_at(n)
+            if heard > 0:
+                if now - heard < 1800:
                     active_nodes += 1
                 else:
                     inactive_nodes += 1
@@ -2331,10 +2484,10 @@ class MeshTopApp:
         footer = "[n] nodes  [m] messages  [s] stats  [↑/↓] scroll tree  [q] quit"
         stdscr.addnstr(h - 1, 0, footer.ljust(maxw), maxw)
 
-    def _router_nums(self) -> set:
+    def _router_counts(self) -> Dict[int, int]:
         """
-        Nodes that connect ME to >= 2 traced nodes: themselves (if traced) plus every
-        other node whose route goes through them. Computed once per frame.
+        Relay nodes -> how many traced nodes they connect ME to (counting themselves
+        if traced). A node is a router when this is >= 2.
         """
         with self.data_lock:
             traced = [(num, n.last_route) for num, n in self.nodes.items()
@@ -2345,11 +2498,11 @@ class MeshTopApp:
             for hop in set(route):
                 if hop not in (num, self.local_num, UNKNOWN_HOP):
                     connected.setdefault(hop, set()).add(num)
-        routers = set()
-        for hop, users in connected.items():
-            if len(users) + (1 if hop in traced_nums else 0) >= 2:
-                routers.add(hop)
-        return routers
+        return {hop: len(users) + (1 if hop in traced_nums else 0) for hop, users in connected.items()}
+
+    def _router_nums(self) -> set:
+        """Nodes that connect ME to >= 2 traced nodes. Computed once per frame."""
+        return {hop for hop, count in self._router_counts().items() if count >= 2}
 
     def _is_router(self, node_num) -> bool:
         return node_num in self._router_nums()

@@ -13,14 +13,18 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
   * **Two-Pass Retry Loop**: Nodes that fail to respond are deferred to a retry queue and retried once at the end of the pass.
   * **Selective 24h Cooldown**: Successfully traced nodes are placed on a **24-hour cooldown**. Unsuccessful traces are immediately rescheduled for retry if they exhibit new mesh activity (with a 5-minute safety cooldown).
   * **Manual Lockout**: Suppresses manual traceroute requests when auto-trace is active (`TRACE suppressed (auto-trace active)`) to prevent packet collisions.
-* **Advanced Curses Visual Highlights**:
-  * 🟩 **Green Rows**: Automatically highlights transit router nodes (nodes serving as relays connecting your local node to $\ge 2$ target nodes).
-  * 🟥 **Red Highlights**: Marks nodes with low battery levels (**20% or lower**) to warn of power degradation.
-  * 🟨 **Yellow Rows**: Highlights your local node.
-* **💬 Conversational Messages Screen (`M` Key)**: A split messenger-style dashboard:
-  * **Left Column**: Lists active conversations (only shows nodes with which you have exchanged messages).
-  * **Right Column**: Displays the message log of the selected conversation.
-  * **Color Coding**: Sent messages are highlighted in **Yellow** (Me), and received messages are highlighted in **Cyan** (node name).
+* **📋 Nodes Table**: Name, how long ago each node was **heard** (`12s`, `4m`, `3h` – also for nodes known only from the radio's node DB), SNR, hops, battery (`PWR` when externally powered), channel utilization, traced route and distance.
+  * 🟩 **Green Rows**: transit router nodes (relays connecting your local node to $\ge 2$ traced nodes).
+  * 🟥 **Red Battery**: low battery (**20% or lower**).
+  * 🟨 **Yellow Row**: your local node.
+  * **Dimmed Rows**: nodes not heard for over 2 hours.
+  * **SNR colors**: green ≥ 0 dB, yellow down to -10 dB, red below.
+* **🔎 Node Detail Pane**: everything about the selected node – ID, hardware, signal, power, sensors, position/distance, which nodes it relays for, and the last trace path with per-hop SNR (plus the return path when it differs). On terminals ≥ 130 columns it sits on the right; on narrower ones it is a 3-line strip under the table.
+* **💬 Messages Screen (`M` Key)**: a messenger-style split view:
+  * **Channels** (named from the radio config, e.g. `# MediumSlow`) are separate from **direct chats**, so replying to a channel post goes to the channel, not privately.
+  * **Unread counts** per conversation, and a `✉ N unread` badge in the header on every screen.
+  * **Delivery status** on sent messages: `…` pending, `✓` relayed by a neighbour, `✓✓` delivered to the recipient, `✗ REASON` failed.
+  * Long messages wrap; day separators between dates. Sent messages are **Yellow**, received **Cyan**.
 * **📈 Stats View (`S` Key)**: A dedicated live dashboard showing:
   * **Node Activity**: Total node count, active (seen in last 30 min), inactive (> 30 min), and unseen/dead.
   * **Routing Statistics**: Total traced stations and calculated **Average Hop Count** of the active topology.
@@ -73,6 +77,7 @@ Inside the dashboard:
 * **`g` / `G`**: Toggle message filtering (ON/OFF) to hide system messages/gibberish.
 * **`q` / `Q`**: Quit the application safely.
 * **`↑/↓`, `PgUp/PgDn`, `Home/End`**: Move the selection (it stays on the same node when the list re-sorts).
+* **`Enter`**: Nodes view – write a direct message to the selected node; Messages view – write to the selected channel or chat.
 
 Shortcuts also work on a Russian or Hebrew keyboard layout (same physical keys). Messages can be typed in any language; the prompt shows the UTF-8 byte count against the 200-byte limit (`Ctrl-U` clears the line).
 
