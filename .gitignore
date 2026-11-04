@@ -5,3 +5,5 @@ topology.md
 .idea/
 traced_stations.json
 *.tmp
+telegram.json
+.venv/
