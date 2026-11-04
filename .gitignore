@@ -6,3 +6,4 @@ topology.md
 traced_stations.json
 *.tmp
 telegram.json
+.venv/

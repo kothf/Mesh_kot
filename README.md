@@ -41,8 +41,11 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
 Ensure you have Python 3 and the required dependencies installed:
 
 ```bash
-pip install meshtastic
+python3 -m venv .venv
+.venv/bin/pip install meshtastic
 ```
+
+`run.sh` uses `.venv` automatically when it exists (or install `meshtastic` into your system Python instead).
 
 ---
 
