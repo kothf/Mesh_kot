@@ -30,6 +30,8 @@ A powerful, interactive Meshtastic Live TUI (Text User Interface) application fo
   * **Routing Statistics**: Total traced stations and calculated **Average Hop Count** of the active topology.
   * **Link Quality (SNR)**: Shows the top 3 best direct links (green edge weights) and top 3 worst direct links (red edge weights).
   * **🌳 Network Connections Map**: A dynamic, recursive text tree graph showing how packets route through intermediate relays. It automatically ranks busier routers first, wraps the tree across multiple columns to utilize extra screen width, and supports vertical scrolling (`[↑/↓]` or `j`/`k`) to navigate larger topologies.
+* **📡 On-Demand Telemetry (`R` Key)**: asks the selected node for fresh battery/voltage/uptime. Since firmware 2.7.13 nodes no longer broadcast telemetry by default, so this is the way to fill the battery and ChU% columns. Your own radio is asked for its **local stats** (noise floor, packets RX/bad/dupe, TX/relayed/dropped, online nodes) every 5 minutes; that request never leaves the radio, so it costs no airtime. Shown in the node detail pane and a **Local Radio** panel on the Stats screen.
+* **🕸️ Neighbor Info (`I` Key)**: asks the selected node which nodes it hears directly, with SNR (Neighbor Info module, on-demand since firmware 2.7.15). Neighbor lists show in the detail pane, are counted on the Stats screen, saved in `traced_stations.json`, and drawn as dotted links in the topology export. Your own radio's list is refreshed every 5 minutes when its Neighbor Info module is on (`meshtastic --set neighbor_info.enabled true`). Nodes that have the module off simply don't answer (shown as `✗ timeout`).
 * **🗺️ Network Topology Export (`P` Key)**: Generates a complete Mermaid diagram map showing all nodes, connections, hops, and SNR weights, exporting it locally to `topology.md`.
 * **📜 Route History Logging**: Appends all successful traceroute paths (including timestamp, destination ID, short name, hops, forward, and return SNR values) to a local `traces.jsonl` database for long-term telemetry analysis.
 * **💾 Traced Stations State Persistence**: Automatically saves all active node trace routes to `traced_stations.json`. On application startup, it reloads this data to restore the connections map immediately (unless the file is older than 24 hours).
@@ -76,6 +78,8 @@ Inside the dashboard:
 * **`m` / `M`**: Switch to **Messages / Conversations** view.
 * **`s` / `S`**: Switch to the **Stats Dashboard** view.
 * **`t` / `T`**: Switch to **Signal Trace** view (or retry/run a manual trace on the selected node).
+* **`r` / `R`** (Nodes view): Request telemetry from the selected node.
+* **`i` / `I`** (Nodes view): Request the selected node's neighbor list.
 * **`p` / `P`**: Export the live network topology map to `topology.md` (from any view).
 * **`g` / `G`**: Toggle message filtering (ON/OFF) to hide system messages/gibberish.
 * **`q` / `Q`**: Quit the application safely.

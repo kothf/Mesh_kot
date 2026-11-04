@@ -8,7 +8,7 @@ import json
 import socket
 import sys
 import traceback
-from meshtastic.protobuf import mesh_pb2, portnums_pb2
+from meshtastic.protobuf import mesh_pb2, portnums_pb2, telemetry_pb2
 import logging
 logging.getLogger("meshtastic").setLevel(logging.WARNING)
 logging.getLogger("pubsub").setLevel(logging.WARNING)
@@ -53,6 +53,14 @@ class NodeInfo:
     air_util: Optional[float] = None
     temperature: Optional[float] = None
     humidity: Optional[float] = None
+    uptime: Optional[int] = None  # seconds, from device metrics
+    telemetry_time: Optional[float] = None  # when device/environment telemetry last arrived
+    local_stats: Optional[dict] = None  # LocalStats telemetry (packet counters, noise floor)
+    local_stats_time: Optional[float] = None
+
+    # NeighborInfo: the nodes this node hears directly, as (node_num, snr_db)
+    neighbors: Optional[List[tuple]] = None
+    neighbors_time: Optional[float] = None
 
     lat: Optional[float] = None
     lon: Optional[float] = None
@@ -628,6 +636,146 @@ class MeshTopApp:
                     return name
         return f"#{num}"
 
+    # ---------- On-demand requests (telemetry, neighbor info) ----------
+    #
+    # Unlike traceroutes these can overlap: each (node, kind) pair has at most one
+    # request in flight, tracked in self.requests. The reply's data is handled by the
+    # normal pubsub callbacks (on_telemetry / on_neighborinfo); the per-request
+    # callback here only records whether the node answered.
+
+    REQUEST_KINDS = {
+        "telemetry": portnums_pb2.PortNum.TELEMETRY_APP,
+        "neighbors": portnums_pb2.PortNum.NEIGHBORINFO_APP,
+    }
+
+    def _request_payload(self, dest_num: int, kind: str):
+        if kind == "neighbors":
+            return mesh_pb2.NeighborInfo()
+        t = telemetry_pb2.Telemetry()
+        if dest_num == self.local_num:
+            t.local_stats.CopyFrom(telemetry_pb2.LocalStats())  # packet counters, noise floor
+        else:
+            t.device_metrics.CopyFrom(telemetry_pb2.DeviceMetrics())
+        return t
+
+    def request_from_node(self, dest_num: int, kind: str) -> Optional[str]:
+        """Ask a node for fresh telemetry or its neighbor list. Returns an error string or None."""
+        iface = self.iface
+        if iface is None or not iface.isConnected.is_set():
+            return "not connected"  # sendData would block the caller for minutes
+        key = (dest_num, kind)
+        now = time.time()
+        with self.data_lock:
+            prev = self.requests.get(key)
+            if prev and prev["state"] == "pending":
+                return None  # already waiting for this one
+            req = {"state": "pending", "started": now, "deadline": now + self.request_timeout_sec,
+                   "req_id": None, "finished": None}
+            self.requests[key] = req
+
+        expected = portnums_pb2.PortNum.Name(self.REQUEST_KINDS[kind])
+
+        def on_request_response(p, req=req):
+            d = p.get("decoded") or {}
+            if d.get("portnum") == expected:
+                self._finish_request(req, "ok")
+            else:
+                reason = (d.get("routing") or {}).get("errorReason") or "unexpected reply"
+                self._finish_request(req, f"failed: {reason}")
+
+        try:
+            pkt = iface.sendData(
+                self._request_payload(dest_num, kind),
+                destinationId=dest_num,
+                portNum=self.REQUEST_KINDS[kind],
+                wantResponse=True,
+                onResponse=on_request_response,
+                channelIndex=0,
+            )
+            req["req_id"] = getattr(pkt, "id", None)
+        except BaseException as e:  # the library may sys.exit() on bad input; never let it kill the UI
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            self._finish_request(req, f"failed: {e}")
+            return str(e)
+        return None
+
+    def _finish_request(self, req: dict, state: str):
+        if req["state"] != "pending":
+            return
+        req["state"] = state
+        req["finished"] = time.time()
+        iface = self.iface
+        if req.get("req_id") is not None and iface is not None:
+            try:  # drop the library's handler for a request we gave up on
+                iface.responseHandlers.pop(req["req_id"], None)
+            except Exception:
+                pass
+
+    def _note_data_arrived(self, num: int, kind: str):
+        """Fresh data from a node settles any request of that kind, even one that timed out."""
+        with self.data_lock:
+            req = self.requests.get((num, kind))
+        if req is None:
+            return
+        if req["state"] == "pending":
+            self._finish_request(req, "ok")
+        else:
+            req["state"] = "ok"
+
+    def _check_request_timeouts(self):
+        now = time.time()
+        with self.data_lock:
+            reqs = list(self.requests.values())
+        for req in reqs:
+            if req["state"] == "pending" and now >= req["deadline"]:
+                self._finish_request(req, "failed: timeout")
+
+    def _request_status(self, num: int, kind: str) -> str:
+        """Short status of the last request of this kind to a node ('' if none)."""
+        with self.data_lock:
+            req = self.requests.get((num, kind))
+        if not req:
+            return ""
+        now = time.time()
+        if req["state"] == "pending":
+            return f"requesting… {now - req['started']:.0f}s"
+        if req["state"] == "ok":
+            return ""  # the data itself shows its age
+        if now - (req["finished"] or now) > 600:
+            return ""  # old failures are noise
+        return f"✗ {req['state'][len('failed: '):]}"
+
+    def _local_neighbor_module_enabled(self) -> Optional[bool]:
+        """Whether the Neighbor Info module is on in our radio's config (None if unknown)."""
+        try:
+            mc = self.iface.localNode.moduleConfig
+            if mc is None or not mc.HasField("neighbor_info"):
+                return None
+            return bool(mc.neighbor_info.enabled)
+        except Exception:
+            return None
+
+    def _local_poll_loop(self):
+        """Every few minutes ask our own radio for its stats and neighbor list.
+
+        Requests addressed to our own node are answered by the radio itself and are
+        never transmitted, so this costs no airtime.
+        """
+        time.sleep(5)
+        while self.running:
+            if self.local_num is not None and self.conn_state == "CONNECTED":
+                try:
+                    self.request_from_node(self.local_num, "telemetry")
+                    if self._local_neighbor_module_enabled():
+                        self.request_from_node(self.local_num, "neighbors")
+                except Exception:
+                    log.exception("local poll failed")
+            for _ in range(self.local_poll_interval_sec):
+                if not self.running:
+                    return
+                time.sleep(1)
+
     def __init__(self, host: str, port: int = 4403):
         NodeInfo._app_instance = self
         self.hide_gibberish = True  # default on; press 'g' to toggle
@@ -698,6 +846,11 @@ class MeshTopApp:
         self.trace_inflight: Optional[dict] = None
         self._handled_trace_ids: set = set()
 
+        # on-demand telemetry / neighbor info requests, keyed by (node_num, kind)
+        self.requests: Dict[tuple, dict] = {}
+        self.request_timeout_sec = 45
+        self.local_poll_interval_sec = 300
+
         # selection is tracked by node number so it doesn't jump when lists re-sort
         self.selected_node_num: Optional[int] = None
         self.selected_chat_key: Optional[tuple] = None  # ("ch", index) or ("dm", node_num)
@@ -725,6 +878,7 @@ class MeshTopApp:
             pub.subscribe(self.on_telemetry, "meshtastic.receive.telemetry")
             pub.subscribe(self.on_position, "meshtastic.receive.position")
             pub.subscribe(self.on_user, "meshtastic.receive.user")
+            pub.subscribe(self.on_neighborinfo, "meshtastic.receive.neighborinfo")
             pub.subscribe(self.on_connection_lost, "meshtastic.connection.lost")
             self._subscribed = True
         self.conn_state = "CONNECTED"
@@ -995,6 +1149,37 @@ class MeshTopApp:
 
         node.temperature = env.get("temperature", node.temperature)
         node.humidity = env.get("relativeHumidity", node.humidity)
+        node.uptime = dev.get("uptimeSeconds", node.uptime)
+        if dev or env:
+            node.telemetry_time = time.time()
+            self._note_data_arrived(num, "telemetry")
+
+        ls = t.get("localStats")
+        if ls:
+            node.local_stats = {k: v for k, v in ls.items() if k != "raw"}
+            node.local_stats_time = time.time()
+            if "uptimeSeconds" in ls:
+                node.uptime = ls["uptimeSeconds"]
+            self._note_data_arrived(num, "telemetry")
+
+    def on_neighborinfo(self, packet, interface):
+        """NeighborInfo report: the list of nodes the sender hears directly, with SNR."""
+        ni = (packet.get("decoded") or {}).get("neighborinfo") or {}
+        num = ni.get("nodeId") or packet.get("from")
+        if num is None:
+            return
+        neighbors = []
+        for nb in ni.get("neighbors") or []:
+            nb_num = nb.get("nodeId")
+            if nb_num is None:
+                continue
+            neighbors.append((int(nb_num), nb.get("snr")))
+        node = self._get_or_create_node(int(num))
+        with self.data_lock:
+            node.neighbors = neighbors
+            node.neighbors_time = time.time()
+        self._note_data_arrived(int(num), "neighbors")
+        self._save_traced_stations()
 
     def on_position(self, packet, interface):
         num = packet.get("from")
@@ -1568,6 +1753,28 @@ class MeshTopApp:
             power.append(f"ChU {node.channel_util:.1f}%")
         if node.air_util is not None:
             power.append(f"Air {node.air_util:.2f}%")
+        if node.uptime:
+            power.append(f"up {fmt_ago(node.uptime)}")
+        tele_status = self._request_status(node.num, "telemetry")
+        if node.telemetry_time and not node.is_me:
+            tele_line = f"Telemetry {fmt_ago(now - node.telemetry_time)} ago"
+        elif node.is_me:
+            tele_line = ""
+        else:
+            tele_line = "No telemetry yet – press r"
+        if tele_status:
+            tele_line = (tele_line + " · " if tele_line else "") + f"telemetry {tele_status}"
+        stats_line = self._local_stats_text(node) if node.is_me else ""
+        nb_text = self._neighbors_text(node)
+        nb_status = self._request_status(node.num, "neighbors")
+        if nb_text:
+            nb_line = f"Neighbors ({fmt_ago(now - node.neighbors_time)} ago): {nb_text}"
+        elif node.neighbors is not None:
+            nb_line = "Neighbors: none reported"
+        else:
+            nb_line = "No neighbor list – press i"
+        if nb_status:
+            nb_line += f" · {nb_status}"
         env = []
         if node.temperature is not None:
             env.append(f"{node.temperature:.1f}°C")
@@ -1592,7 +1799,9 @@ class MeshTopApp:
         dim = curses.A_DIM
         if compact:
             line2 = " · ".join(radio + power + env + ([pos] if pos else []))
-            return [(f"{title}  ({ident})", bold), (line2, 0), (route_line, dim if not route else 0)]
+            line3 = " · ".join([route_line] + [f"{k} {st}" for k, st in (("telemetry", tele_status),
+                                                                         ("neighbors", nb_status)) if st])
+            return [(f"{title}  ({ident})", bold), (line2, 0), (line3, dim if not route else 0)]
 
         lines = [(title, bold), (ident, dim), ("", 0), (" · ".join(radio), 0)]
         if power:
@@ -1603,6 +1812,11 @@ class MeshTopApp:
             lines.append((pos, 0))
         if router_for:
             lines.append((f"Relay for {router_for} traced node{'s' if router_for != 1 else ''}", curses.color_pair(2)))
+        if stats_line:
+            lines.append((stats_line, 0))
+        if tele_line:
+            lines.append((tele_line, curses.color_pair(1) if "✗" in tele_line else dim))
+        lines.append((nb_line, curses.color_pair(1) if "✗" in nb_line else 0 if nb_text else dim))
         lines.append(("", 0))
         if route:
             ago = f" ({fmt_ago(now - node.last_route_time)} ago)" if node.last_route_time else ""
@@ -1614,12 +1828,42 @@ class MeshTopApp:
                 lines += [(l, 0) for l in wrap_cells(back, width)]
         else:
             lines.append((route_line, dim))
-        lines += [("", 0), ("[Enter] message  [t] trace", dim)]
+        lines += [("", 0), ("[Enter] message  [t] trace  [r] telemetry  [i] neighbors", dim)]
         out = []
         for text, attr in lines:
             wrapped = wrap_cells(text, width) if text else [""]
             out += [(l, attr) for l in wrapped]
         return out
+
+    def _neighbors_text(self, node: NodeInfo) -> str:
+        """'NAME +5.0, NAME -3.2' for a node's reported neighbors, best SNR first."""
+        nbs = list(node.neighbors or [])
+        nbs.sort(key=lambda x: x[1] if x[1] is not None else -999, reverse=True)
+        parts = []
+        for num, snr in nbs:
+            name = self._node_label(num)
+            parts.append(f"{name} {snr:+.1f}" if snr is not None else name)
+        return ", ".join(parts)
+
+    @staticmethod
+    def _local_stats_text(node: NodeInfo) -> str:
+        ls = node.local_stats or {}
+        if not ls:
+            return ""
+        parts = []
+        if ls.get("noiseFloor") is not None:
+            parts.append(f"noise {ls['noiseFloor']} dBm")
+        rx = ls.get("numPacketsRx")
+        if rx is not None:
+            extra = ", ".join(f"{k} {ls[f]}" for k, f in (("bad", "numPacketsRxBad"), ("dupe", "numRxDupe")) if ls.get(f))
+            parts.append(f"rx {rx}" + (f" ({extra})" if extra else ""))
+        tx = ls.get("numPacketsTx")
+        if tx is not None:
+            extra = ", ".join(f"{k} {ls[f]}" for k, f in (("relay", "numTxRelay"), ("dropped", "numTxDropped")) if ls.get(f))
+            parts.append(f"tx {tx}" + (f" ({extra})" if extra else ""))
+        if ls.get("numOnlineNodes") is not None:
+            parts.append(f"{ls['numOnlineNodes']}/{ls.get('numTotalNodes', '?')} nodes online")
+        return " · ".join(parts)
 
     def _draw_nodes_view(self, stdscr):
         h, w = stdscr.getmaxyx()
@@ -1740,7 +1984,7 @@ class MeshTopApp:
 
         self._draw_message_log(stdscr, start_row=h - 1 - log_rows, max_rows=log_rows)
 
-        footer = "[↑↓] select  [Enter] message  [t] trace  [m] messages  [s] stats  [p] export  [q] quit"
+        footer = "[↑↓] select  [Enter] msg  [t] trace  [r] telemetry  [i] neighbors  [m] msgs  [s] stats  [p] export  [q] quit"
         stdscr.addnstr(h - 1, 0, ljust_cells(footer, maxw), maxw, curses.A_DIM)
 
     def _sorted_nodes(self) -> List[NodeInfo]:
@@ -1917,6 +2161,12 @@ class MeshTopApp:
                 self.view_mode = "TRACE"
                 self._need_full_clear = True
                 self._send_trace_to_current()
+        elif ch in (ord('r'), ord('R')):
+            if nodes_list:
+                self.request_from_node(nodes_list[self.selected_node_index].num, "telemetry")
+        elif ch in (ord('i'), ord('I')):
+            if nodes_list:
+                self.request_from_node(nodes_list[self.selected_node_index].num, "neighbors")
 
     def _handle_msgs_keys(self, ch):
         convs = self._conversations()
@@ -2032,8 +2282,14 @@ class MeshTopApp:
             "traces": {}
         }
 
+        data_to_save["neighbors"] = {}
         with self.data_lock:
             for num, node in self.nodes.items():
+                if node.neighbors is not None and node.neighbors_time:
+                    data_to_save["neighbors"][str(num)] = {
+                        "neighbors": [list(nb) for nb in node.neighbors],
+                        "time": node.neighbors_time,
+                    }
                 if getattr(node, "last_route_time", None) is not None and node.last_route_time > 0:
                     data_to_save["traces"][str(num)] = {
                         "last_route": node.last_route,
@@ -2093,6 +2349,16 @@ class MeshTopApp:
                 node.last_route_back = trace_info.get("last_route_back")
                 node.last_route_time = trace_info.get("last_route_time")
 
+            for num_str, nb_info in (data.get("neighbors") or {}).items():
+                try:
+                    num = int(num_str)
+                    neighbors = [(int(nb[0]), nb[1]) for nb in nb_info.get("neighbors") or []]
+                except (ValueError, TypeError, IndexError, AttributeError):
+                    continue
+                node = self._get_or_create_node(num)
+                node.neighbors = neighbors
+                node.neighbors_time = nb_info.get("time")
+
     def run_curses(self, stdscr):
         stdscr = SafeWin(stdscr)
         try:
@@ -2149,6 +2415,7 @@ class MeshTopApp:
             self._need_full_clear = False
 
         self._check_trace_timeout()
+        self._check_request_timeouts()
 
         h, w = stdscr.getmaxyx()
         if h < 10 or w < 60:
@@ -2331,9 +2598,59 @@ class MeshTopApp:
         stdscr.addnstr(row, 4, f"Traced Stations:   {len(hop_counts)}", maxw - 6)
         row += 1
         stdscr.addnstr(row, 4, f"Average Hop Count: {avg_hops:.2f} hops", maxw - 6)
-        
+        row += 1
+        nb_reports = [n for n in nodes_list if n.neighbors is not None]
+        nb_links = {tuple(sorted((n.num, nb))) for n in nb_reports for nb, _ in n.neighbors}
+        stdscr.addnstr(row, 4, f"Neighbor Reports:  {len(nb_reports)} nodes, {len(nb_links)} links", maxw - 6)
+
         row += 2
-        
+
+        # --- Local Radio Panel (LocalStats telemetry from our own node) ---
+        lw = 38 if w >= 80 else maxw - 6  # the connections map starts at column 42 on wide screens
+        stdscr.attron(curses.A_BOLD | curses.color_pair(3))
+        stdscr.addnstr(row, 2, "■ LOCAL RADIO", maxw - 4)
+        stdscr.attroff(curses.A_BOLD | curses.color_pair(3))
+        row += 1
+        me = self.nodes.get(self.local_num) if self.local_num is not None else None
+        ls = (me.local_stats if me else None) or {}
+        if ls:
+            line = []
+            if ls.get("noiseFloor") is not None:
+                line.append(f"Noise: {ls['noiseFloor']} dBm")
+            if ls.get("uptimeSeconds") is not None:
+                line.append(f"Uptime: {fmt_ago(ls['uptimeSeconds'])}")
+            util = []
+            if ls.get("channelUtilization") is not None:
+                util.append(f"ChUtil {ls['channelUtilization']:.1f}%")
+            if ls.get("airUtilTx") is not None:
+                util.append(f"AirTX {ls['airUtilTx']:.2f}%")
+            for text in ("  ".join(line), "  ".join(util)):
+                if text:
+                    stdscr.addnstr(row, 4, text, lw)
+                    row += 1
+            rx, bad, dupe = ls.get("numPacketsRx", 0), ls.get("numPacketsRxBad", 0), ls.get("numRxDupe", 0)
+            bad_pct = f" ({100.0 * bad / rx:.1f}%)" if rx else ""
+            stdscr.addnstr(row, 4, f"RX {rx}  bad {bad}{bad_pct}  dupe {dupe}", lw,
+                           curses.color_pair(1) if rx and bad / rx > 0.2 else 0)
+            row += 1
+            stdscr.addnstr(row, 4, f"TX {ls.get('numPacketsTx', 0)}  relay {ls.get('numTxRelay', 0)}"
+                                   f"  drop {ls.get('numTxDropped', 0)}", lw)
+            row += 1
+            age = fmt_ago(now - me.local_stats_time) if me and me.local_stats_time else "?"
+            stdscr.addnstr(row, 4, f"Online {ls.get('numOnlineNodes', '?')}/{ls.get('numTotalNodes', '?')}"
+                                   f"  (updated {age} ago)", lw, curses.A_DIM)
+            row += 1
+        else:
+            status = self._request_status(self.local_num, "telemetry") if self.local_num is not None else ""
+            stdscr.addnstr(row, 4, f"(waiting for radio stats) {status}", lw, curses.A_DIM)
+            row += 1
+        if self._local_neighbor_module_enabled() is False:
+            stdscr.addnstr(row, 4, "Neighbor Info is off on your radio:", lw, curses.A_DIM)
+            stdscr.addnstr(row + 1, 4, " --set neighbor_info.enabled true", lw, curses.A_DIM)
+            row += 2
+
+        row += 1
+
         # --- Link Quality Panel ---
         stdscr.attron(curses.A_BOLD | curses.color_pair(3))
         stdscr.addnstr(row, 2, "■ DIRECT LINK QUALITY (SNR)", maxw - 4)
@@ -2596,6 +2913,19 @@ class MeshTopApp:
 
                     edges.add((id_from, id_to, label))
 
+        # Neighbor Info links (direct radio links reported by the nodes themselves)
+        nb_edges = {}
+        for node in nodes_list:
+            for nb_num, snr in node.neighbors or []:
+                pair = tuple(sorted((node.num, nb_num)))
+                if pair not in nb_edges or (snr is not None and (nb_edges[pair] is None or snr > nb_edges[pair])):
+                    nb_edges[pair] = snr
+        for (a, b), snr in nb_edges.items():
+            node_defs.add(self.node_definition(a))
+            node_defs.add(self.node_definition(b))
+            label = f"{snr:+.1f}dB" if snr is not None else ""
+            edges.add((self._mermaid_node_id(a), self._mermaid_node_id(b), "nb:" + label))
+
         # Generate content
         lines = []
         lines.append("# Meshtastic Network Topology")
@@ -2610,7 +2940,10 @@ class MeshTopApp:
 
         # Edges
         for n_from, n_to, label in sorted(edges):
-            if label:
+            if label.startswith("nb:"):  # neighbor link: dotted, undirected
+                label = label[3:]
+                lines.append(f"  {n_from} -.-|{label}| {n_to}" if label else f"  {n_from} -.- {n_to}")
+            elif label:
                 lines.append(f"  {n_from} -->|{label}| {n_to}")
             else:
                 lines.append(f"  {n_from} --> {n_to}")
@@ -2758,6 +3091,7 @@ class MeshTopApp:
             self.auto_trace_thread = threading.Thread(target=self._auto_trace_loop, daemon=True, name="auto-trace")
             self.auto_trace_thread.start()
             threading.Thread(target=self._connection_supervisor, daemon=True, name="conn-supervisor").start()
+            threading.Thread(target=self._local_poll_loop, daemon=True, name="local-poll").start()
             # The meshtastic library print()s tracebacks and messages from its threads;
             # send them to the log file instead of scribbling over the curses screen.
             saved = sys.stdout, sys.stderr
