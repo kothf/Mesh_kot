@@ -83,6 +83,28 @@ Shortcuts also work on a Russian or Hebrew keyboard layout (same physical keys).
 
 ---
 
+## 📨 Telegram Forwarding
+
+Every **incoming** text message (channel posts and direct messages, after the gibberish filter) can be forwarded to a Telegram chat through your bot. It is off unless a bot token is configured.
+
+1. Create `telegram.json` next to `meshtop_live.py` (it is git-ignored, keep it private):
+   ```json
+   {"bot_token": "123456789:AA..."}
+   ```
+   or export `TELEGRAM_BOT_TOKEN` (and optionally `TELEGRAM_CHAT_ID`) instead. Environment variables win over the file.
+2. Open your bot in Telegram and send it `/start` (or add it to a group/channel and post there).
+3. Run the app. If no `chat_id` is set, it picks the chat that last messaged the bot and saves its id into `telegram.json`.
+
+Messages look like:
+```
+📡 # MediumSlow
+ABCD (Alice's node, !a1b2c3d4):
+hello mesh
+```
+Sending runs on a background thread (about 1 message per second, with retries on rate limits), so a slow or offline Telegram never blocks the UI. Problems are written to `meshtop.log`.
+
+---
+
 ## 🔌 Connection & Logging
 
 * If the radio reboots or WiFi drops, the header shows `[RECONNECTING]` and the app reconnects by itself with backoff (TCP keepalive detects dead links within about a minute).

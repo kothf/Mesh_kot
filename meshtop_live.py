@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 from pubsub import pub
 from meshtastic.tcp_interface import TCPInterface
 from archiver import MessageArchiver
+from telegram_forwarder import TelegramForwarder
 
 
 
@@ -654,6 +655,12 @@ class MeshTopApp:
 
         # message archiver
         self.archiver = MessageArchiver(max_size_mib=5)
+        # optional Telegram forwarding of incoming messages (None if not configured)
+        try:
+            self.telegram = TelegramForwarder.from_config()
+        except Exception:
+            logging.getLogger("meshtop").exception("Telegram forwarder init failed")
+            self.telegram = None
         # load recent history (up to 1000 lines)
         self._load_archived_messages(max_lines=1000)
 
@@ -1114,6 +1121,10 @@ class MeshTopApp:
                 )
             )
 
+        if direction == "IN" and self.telegram:
+            self._forward_to_telegram(from_node, from_id, from_short, to_short,
+                                      is_broadcast, packet.get("channel", 0) or 0, text)
+
         # best-effort archive
         try:
             self.archiver.write({
@@ -1135,6 +1146,16 @@ class MeshTopApp:
             })
         except Exception:
             pass
+
+    def _forward_to_telegram(self, from_node, from_id, from_short, to_short,
+                             is_broadcast, channel, text):
+        try:
+            long_name = from_node.long_name if from_node and from_node.long_name not in (None, "?") else ""
+            sender = f"{from_short} ({long_name}, {from_id})" if long_name else f"{from_short} ({from_id})"
+            where = f"# {self._channel_name(channel)}" if is_broadcast else f"DM to {to_short}"
+            self.telegram.forward(f"📡 {where}\n{sender}:\n{text}")
+        except Exception:
+            logging.getLogger("meshtop").exception("Telegram forward failed")
 
     # ---------- Sending text ----------
 
